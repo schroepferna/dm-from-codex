@@ -7,7 +7,7 @@ import { NativeService } from './native.service';
 
 const AUTH_STORAGE_KEY = 'nda-download-manager.auth';
 const SESSION_ID_STORAGE_KEY = 'nda-download-manager.sessionId';
-const HEARTBEAT_INTERVAL_MS = 15 * 60 * 1000;
+const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
 const AUTH_REQUEST_TIMEOUT_MS = 30000;
 const CONFIGURED_HOST = trimTrailingSlash(environment.apiHost);
 
@@ -75,11 +75,17 @@ export class AuthService {
         throw new Error(verification.errorMessage || 'Token verification failed.');
       }
 
+      const sessionVerification = await this.verifySessionWithAuth(host, token, storedSessionId);
+
+      if (!sessionVerification.valid) {
+        throw new Error(sessionVerification.errorMessage || 'Session is invalid or expired.');
+      }
+
       const next: AuthState = {
         host,
         sessionId: storedSessionId,
         token,
-        username: verification.username,
+        username: sessionVerification.username || verification.username,
         authenticated: true,
         lastVerifiedAt: new Date().toISOString()
       };
@@ -151,13 +157,7 @@ export class AuthService {
       return false;
     }
 
-    const response = this.native.isDesktop
-      ? await this.native.verifySession({ host, token, sessionId })
-      : await firstValueFrom(this.http.post<VerifyResponse>(
-        `${trimTrailingSlash(host)}/api/ras/verifySession`,
-        { jSessionId: sessionId },
-        { headers: bearerHeaders(token) }
-      ).pipe(timeout(AUTH_REQUEST_TIMEOUT_MS)));
+    const response = await this.verifySessionWithAuth(host, token, sessionId);
 
     if (!response.valid) {
       this.signOut();
@@ -222,8 +222,41 @@ export class AuthService {
   private startHeartbeat(): void {
     this.stopHeartbeat();
     this.heartbeatTimer = window.setInterval(() => {
-      void this.refreshToken().catch(() => this.signOut());
+      void this.keepSessionAlive();
     }, HEARTBEAT_INTERVAL_MS);
+  }
+
+  private async keepSessionAlive(): Promise<void> {
+    const { host, sessionId, token } = this.snapshot;
+    if (!sessionId || !token) {
+      return;
+    }
+
+    try {
+      const sessionVerification = await this.verifySessionWithAuth(host, token, sessionId);
+      if (!sessionVerification.valid) {
+        this.signOut();
+        return;
+      }
+
+      this.setState({
+        ...this.snapshot,
+        username: sessionVerification.username || this.snapshot.username,
+        lastVerifiedAt: new Date().toISOString()
+      });
+    } catch (error) {
+      console.warn('Session keep-alive failed.', error);
+    }
+  }
+
+  private verifySessionWithAuth(host: string, token: string, sessionId: string): Promise<VerifyResponse> {
+    return this.native.isDesktop
+      ? this.native.verifySession({ host, token, sessionId })
+      : firstValueFrom(this.http.post<VerifyResponse>(
+        `${trimTrailingSlash(host)}/api/ras/verifySession`,
+        { jSessionId: sessionId },
+        { headers: bearerHeaders(token) }
+      ).pipe(timeout(AUTH_REQUEST_TIMEOUT_MS)));
   }
 
   private stopHeartbeat(): void {

@@ -52,8 +52,10 @@
     "files": [
       "dist/**/*",
       "dist-electron/**/*",
+      "ndaicon.ico",
       "package.json"
     ],
+    "icon": "ndaicon.ico",
     "protocols": [
       {
         "name": "NDA Download Manager",
@@ -66,7 +68,8 @@
       "category": "public.app-category.productivity"
     },
     "win": {
-      "target": "nsis"
+      "target": "nsis",
+      "icon": "ndaicon.ico"
     },
     "linux": {
       "target": [

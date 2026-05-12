@@ -4,7 +4,6 @@ import { firstValueFrom } from 'rxjs';
 import {
   MyPackageDto,
   PackageFileDto,
-  PackageFilesResponse,
   SharedPackageDto
 } from '../models/package.models';
 import { bearerHeaders, trimTrailingSlash } from './auth.service';
@@ -75,13 +74,14 @@ export class PackageService {
   }
 
   private async fetchAndCacheFiles(host: string, token: string, packageId: number): Promise<PackageFileDto[]> {
-    const response = await firstValueFrom(this.http.get<PackageFilesResponse>(
+    const response = await firstValueFrom(this.http.get<unknown>(
       `${trimTrailingSlash(host)}/api/package/${packageId}/files`,
       { headers: bearerHeaders(token) }
     ));
+    const files = normalizePackageFilesResponse(response);
 
-    this.fileCache.set(this.fileCacheKey(host, packageId), response.results);
-    return response.results;
+    this.fileCache.set(this.fileCacheKey(host, packageId), files);
+    return files;
   }
 
   private fileCacheKey(host: string, packageId: number): string {
@@ -113,4 +113,108 @@ function errorMessage(error: unknown): string {
   }
 
   return 'An unexpected error occurred.';
+}
+
+function normalizePackageFilesResponse(response: unknown): PackageFileDto[] {
+  if (Array.isArray(response)) {
+    return response.map(normalizePackageFile);
+  }
+
+  if (response && typeof response === 'object') {
+    const results = (response as Record<string, unknown>)['results'];
+    if (Array.isArray(results)) {
+      return results.map(normalizePackageFile);
+    }
+  }
+
+  throw new Error('Package files response was empty or malformed.');
+}
+
+function normalizePackageFile(value: unknown): PackageFileDto {
+  if (!value || typeof value !== 'object') {
+    throw new Error('Package file response item was empty or malformed.');
+  }
+
+  const record = value as Record<string, unknown>;
+  const packageFileId = readRequiredNumber(record, ['package_file_id', 'packageFileId'], 'package file id');
+  const downloadAlias = readRequiredString(record, ['download_alias', 'downloadAlias'], 'download alias');
+  const isAssociatedFile = readBoolean(record, ['is_associated_file', 'isAssociatedFile', 'associatedFile'], false);
+  const isDataFile = readBoolean(record, ['is_data_file', 'isDataFile', 'dataFile'], false);
+  const isDocumentFile = readBoolean(record, ['is_document_file', 'isDocumentFile', 'documentFile'], false);
+
+  return {
+    download_alias: downloadAlias,
+    file_size: readNumber(record, ['file_size', 'fileSize'], 0),
+    is_associated_file: isAssociatedFile,
+    created_date: readString(record, ['created_date', 'createdDate'], ''),
+    is_data_file: isDataFile,
+    is_document_file: isDocumentFile,
+    nda_file_type: readString(record, ['nda_file_type', 'ndaFileType'], ''),
+    associatedFile: readBoolean(record, ['associatedFile', 'is_associated_file', 'isAssociatedFile'], isAssociatedFile),
+    dataFile: readBoolean(record, ['dataFile', 'is_data_file', 'isDataFile'], isDataFile),
+    documentFile: readBoolean(record, ['documentFile', 'is_document_file', 'isDocumentFile'], isDocumentFile),
+    package_file_id: packageFileId
+  };
+}
+
+function readRequiredNumber(record: Record<string, unknown>, keys: string[], label: string): number {
+  const value = readNumber(record, keys, Number.NaN);
+  if (!Number.isFinite(value)) {
+    throw new Error(`Package file response is missing ${label}.`);
+  }
+
+  return value;
+}
+
+function readNumber(record: Record<string, unknown>, keys: string[], fallback: number): number {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return value;
+    }
+
+    if (typeof value === 'string' && value.trim()) {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
+  }
+
+  return fallback;
+}
+
+function readRequiredString(record: Record<string, unknown>, keys: string[], label: string): string {
+  const value = readString(record, keys, '');
+  if (!value) {
+    throw new Error(`Package file response is missing ${label}.`);
+  }
+
+  return value;
+}
+
+function readString(record: Record<string, unknown>, keys: string[], fallback: string): string {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'string' && value.trim()) {
+      return value.trim();
+    }
+  }
+
+  return fallback;
+}
+
+function readBoolean(record: Record<string, unknown>, keys: string[], fallback: boolean): boolean {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'boolean') {
+      return value;
+    }
+
+    if (typeof value === 'string' && value.trim()) {
+      return value.trim().toLowerCase() === 'true';
+    }
+  }
+
+  return fallback;
 }

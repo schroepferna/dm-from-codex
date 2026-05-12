@@ -6,6 +6,7 @@ export interface NativeFileInput {
 
 export interface ScanDownloadRequest {
   targetDir: string;
+  packageId: number;
   files: NativeFileInput[];
 }
 
@@ -23,6 +24,11 @@ export interface ScanDownloadResult {
 export interface AvailableSpaceResult {
   availableBytes: number;
   path: string;
+}
+
+export interface ShowPackageRequest {
+  targetDir: string;
+  packageId: number;
 }
 
 export interface DownloadStartRequest {
@@ -47,7 +53,8 @@ export interface DownloadEvent {
   packageName: string;
   packageFileId?: number;
   downloadAlias?: string;
-  status: 'queued' | 'fetching-token' | 'downloading' | 'skipped' | 'complete' | 'error' | 'cancelled' | 'job-complete' | 'heartbeat';
+  status: 'queued' | 'fetching-token' | 'downloading' | 'paused' | 'skipped' | 'complete' | 'error' | 'cancelled' | 'job-complete' | 'heartbeat';
+  isPaused?: boolean;
   receivedBytes?: number;
   totalBytes?: number;
   path?: string;
@@ -103,7 +110,11 @@ export interface NdaDesktopBridge {
   getAvailableSpace(targetDir: string): Promise<AvailableSpaceResult>;
   chooseDownloadDirectory(): Promise<string | null>;
   scanDownloadDirectory(request: ScanDownloadRequest): Promise<ScanDownloadResult[]>;
+  showItemInFolder(path: string): Promise<void>;
+  showPackageInFolder(request: ShowPackageRequest): Promise<void>;
   startDownloadJob(request: DownloadStartRequest): Promise<DownloadStartResult>;
+  pauseDownloadJob(jobId: string): Promise<void>;
+  resumeDownloadJob(jobId: string): Promise<void>;
   cancelDownloadJob(jobId: string): Promise<void>;
   sendHelpRequest(request: HelpRequest): Promise<HelpResponse>;
   onAuthCallback(callback: (payload: AuthCallbackPayload) => void): () => void;

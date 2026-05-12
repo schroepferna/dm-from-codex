@@ -88,6 +88,7 @@ export interface UiFile extends PackageFileDto {
   localStatus: LocalFileStatus;
   localSize: number | null;
   localModifiedAt: string | null;
+  localPath: string | null;
   downloadStatus: string | null;
   receivedBytes: number;
   totalBytes: number;

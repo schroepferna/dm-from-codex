@@ -13,7 +13,8 @@ import {
   HelpRequest,
   HelpResponse,
   ScanDownloadRequest,
-  ScanDownloadResult
+  ScanDownloadResult,
+  ShowPackageRequest
 } from '../models/native-api.models';
 
 @Injectable({ providedIn: 'root' })
@@ -91,12 +92,44 @@ export class NativeService {
     return window.ndaDm.scanDownloadDirectory(request);
   }
 
+  showItemInFolder(path: string): Promise<void> {
+    if (!window.ndaDm) {
+      return Promise.reject(new Error('Showing files requires the desktop app.'));
+    }
+
+    return window.ndaDm.showItemInFolder(path);
+  }
+
+  showPackageInFolder(request: ShowPackageRequest): Promise<void> {
+    if (!window.ndaDm) {
+      return Promise.reject(new Error('Showing packages requires the desktop app.'));
+    }
+
+    return window.ndaDm.showPackageInFolder(request);
+  }
+
   startDownloadJob(request: DownloadStartRequest): Promise<DownloadStartResult> {
     if (!window.ndaDm) {
       return Promise.reject(new Error('Downloads require the desktop app.'));
     }
 
     return window.ndaDm.startDownloadJob(request);
+  }
+
+  pauseDownloadJob(jobId: string): Promise<void> {
+    if (!window.ndaDm) {
+      return Promise.resolve();
+    }
+
+    return window.ndaDm.pauseDownloadJob(jobId);
+  }
+
+  resumeDownloadJob(jobId: string): Promise<void> {
+    if (!window.ndaDm) {
+      return Promise.resolve();
+    }
+
+    return window.ndaDm.resumeDownloadJob(jobId);
   }
 
   cancelDownloadJob(jobId: string): Promise<void> {

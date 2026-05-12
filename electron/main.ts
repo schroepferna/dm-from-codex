@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import { mkdir, open, rename, rm, stat, statfs } from 'node:fs/promises';
 import https from 'node:https';
 import path from 'node:path';
-import { Readable } from 'node:stream';
+import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { GetObjectCommand, HeadObjectCommand, S3Client } from '@aws-sdk/client-s3';
 
@@ -13,9 +13,10 @@ const DEFAULT_AWS_REGION = process.env['NDA_DM_AWS_REGION'] || 'us-east-1';
 const DEFAULT_FILE_CONCURRENCY = 2;
 const DEFAULT_CHUNK_CONCURRENCY = 4;
 const CHUNK_SIZE_BYTES = 64 * 1024 * 1024;
-const HEARTBEAT_INTERVAL_MS = 15 * 60 * 1000;
+const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
 const AUTH_CALLBACK_TTL_MS = 5 * 60 * 1000;
 const AUTH_REQUEST_TIMEOUT_MS = 30000;
+const DISK_SPACE_TIMEOUT_MS = 15000;
 const ZENDESK_TOKEN = process.env['NDA_DM_ZENDESK_TOKEN'] || '';
 
 interface NativeFileInput {
@@ -26,7 +27,13 @@ interface NativeFileInput {
 
 interface ScanDownloadRequest {
   targetDir: string;
+  packageId: number;
   files: NativeFileInput[];
+}
+
+interface ShowPackageRequest {
+  targetDir: string;
+  packageId: number;
 }
 
 interface AuthCompleteRequest {
@@ -69,7 +76,8 @@ interface DownloadEvent {
   packageName: string;
   packageFileId?: number;
   downloadAlias?: string;
-  status: 'queued' | 'fetching-token' | 'downloading' | 'skipped' | 'complete' | 'error' | 'cancelled' | 'job-complete' | 'heartbeat';
+  status: 'queued' | 'fetching-token' | 'downloading' | 'paused' | 'skipped' | 'complete' | 'error' | 'cancelled' | 'job-complete' | 'heartbeat';
+  isPaused?: boolean;
   receivedBytes?: number;
   totalBytes?: number;
   path?: string;
@@ -82,6 +90,9 @@ interface DownloadJob {
   abortController: AbortController;
   sender: WebContents;
   heartbeatTimer: NodeJS.Timeout | null;
+  paused: boolean;
+  pauseWaiters: Array<() => void>;
+  activeFiles: Map<number, NativeFileInput>;
 }
 
 interface HelpRequest {
@@ -92,6 +103,8 @@ interface HelpRequest {
 }
 
 let mainWindow: BrowserWindow | null = null;
+let authWindow: BrowserWindow | null = null;
+const authWindows = new Set<BrowserWindow>();
 let pendingAuthCallback: { url: string; sessionId: string } | null = null;
 const jobs = new Map<string, DownloadJob>();
 
@@ -177,6 +190,7 @@ async function createWindow(): Promise<void> {
     height: 860,
     minWidth: 1024,
     minHeight: 720,
+    icon: getAppIconPath(),
     backgroundColor: '#f7f8fb',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -195,6 +209,114 @@ async function createWindow(): Promise<void> {
     await mainWindow.loadFile(getPackagedRendererIndex());
   } else {
     await mainWindow.loadURL('http://127.0.0.1:4200');
+  }
+}
+
+function getAppIconPath(): string {
+  return path.join(__dirname, '..', 'ndaicon.ico');
+}
+
+async function openPrivateAuthWindow(authUrl: string): Promise<void> {
+  closeAuthWindow();
+
+  const authPartition = `auth-${randomUUID()}`;
+  authWindow = new BrowserWindow({
+    width: 1040,
+    height: 780,
+    minWidth: 760,
+    minHeight: 620,
+    parent: mainWindow ?? undefined,
+    title: 'RAS Sign In',
+    backgroundColor: '#ffffff',
+    webPreferences: {
+      partition: authPartition,
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true
+    }
+  });
+
+  configureAuthWindow(authWindow, authPartition);
+
+  await authWindow.loadURL(authUrl);
+}
+
+function configureAuthWindow(window: BrowserWindow, authPartition: string): void {
+  authWindows.add(window);
+
+  window.on('closed', () => {
+    authWindows.delete(window);
+    if (authWindow === window) {
+      authWindow = null;
+    }
+  });
+
+  window.webContents.on('will-navigate', (event, url) => {
+    if (handleAuthNavigation(url)) {
+      event.preventDefault();
+    }
+  });
+
+  window.webContents.on('will-redirect', (event, url) => {
+    if (handleAuthNavigation(url)) {
+      event.preventDefault();
+    }
+  });
+
+  window.webContents.setWindowOpenHandler(({ url }) => {
+    if (handleAuthNavigation(url)) {
+      return { action: 'deny' };
+    }
+
+    try {
+      assertHttpUrl(url);
+      return {
+        action: 'allow',
+        overrideBrowserWindowOptions: {
+          parent: window,
+          width: 940,
+          height: 700,
+          title: 'RAS Sign In',
+          webPreferences: {
+            partition: authPartition,
+            contextIsolation: true,
+            nodeIntegration: false,
+            sandbox: true
+          }
+        }
+      };
+    } catch {
+      return { action: 'deny' };
+    }
+  });
+
+  window.webContents.on('did-create-window', (childWindow) => {
+    configureAuthWindow(childWindow, authPartition);
+  });
+}
+
+function handleAuthNavigation(url: string): boolean {
+  const callbackUrl = normalizeProtocolUrl(url);
+  if (!callbackUrl) {
+    return false;
+  }
+
+  handleAuthCallback(callbackUrl);
+  closeAuthWindow();
+  return true;
+}
+
+function closeAuthWindow(): void {
+  if (authWindows.size === 0) {
+    return;
+  }
+
+  authWindow = null;
+
+  for (const window of Array.from(authWindows)) {
+    if (!window.isDestroyed()) {
+      window.close();
+    }
   }
 }
 
@@ -300,7 +422,7 @@ function extractSessionId(rawUrl: string): string | null {
 function registerIpcHandlers(): void {
   ipcMain.handle('auth:open-url', async (_event, authUrl: string) => {
     assertHttpUrl(authUrl);
-    await shell.openExternal(authUrl);
+    await openPrivateAuthWindow(authUrl);
   });
 
   ipcMain.handle('auth:get-pending-callback', async () => {
@@ -337,20 +459,52 @@ function registerIpcHandlers(): void {
     return scanDownloadDirectory(request);
   });
 
+  ipcMain.handle('fs:show-item', async (_event, itemPath: string) => {
+    return showItemInFolder(itemPath);
+  });
+
+  ipcMain.handle('fs:show-package', async (_event, request: ShowPackageRequest) => {
+    return showPackageInFolder(request);
+  });
+
   ipcMain.handle('download:start', async (event, request: DownloadStartRequest) => {
     validateDownloadStartRequest(request);
+    console.info(
+      `Starting download job for package ${request.packageId}; files ${request.files.map((file) => file.packageFileId).join(', ')}.`
+    );
 
     const job: DownloadJob = {
       id: randomUUID(),
       request,
       abortController: new AbortController(),
       sender: event.sender,
-      heartbeatTimer: null
+      heartbeatTimer: null,
+      paused: false,
+      pauseWaiters: [],
+      activeFiles: new Map()
     };
 
     jobs.set(job.id, job);
+    sendDownloadEvent(job, {
+      status: 'queued',
+      message: `Queued package ${request.packageId}, file${request.files.length === 1 ? '' : 's'} ${request.files.map((file) => file.packageFileId).join(', ')}.`
+    });
     void runDownloadJob(job).finally(() => jobs.delete(job.id));
     return { jobId: job.id };
+  });
+
+  ipcMain.handle('download:pause', async (_event, jobId: string) => {
+    const job = jobs.get(jobId);
+    if (job) {
+      pauseDownloadJob(job);
+    }
+  });
+
+  ipcMain.handle('download:resume', async (_event, jobId: string) => {
+    const job = jobs.get(jobId);
+    if (job) {
+      resumeDownloadJob(job);
+    }
   });
 
   ipcMain.handle('download:cancel', async (_event, jobId: string) => {
@@ -377,6 +531,34 @@ async function getAvailableSpace(targetDir: string): Promise<{ availableBytes: n
     availableBytes: result.bavail * result.bsize,
     path: existingPath
   };
+}
+
+async function showItemInFolder(itemPath: string): Promise<void> {
+  if (!itemPath || typeof itemPath !== 'string') {
+    throw new Error('A file or folder path is required.');
+  }
+
+  const resolvedPath = path.resolve(itemPath);
+  const itemStat = await stat(resolvedPath);
+
+  if (itemStat.isDirectory()) {
+    const error = await shell.openPath(resolvedPath);
+    if (error) {
+      throw new Error(error);
+    }
+    return;
+  }
+
+  shell.showItemInFolder(resolvedPath);
+}
+
+async function showPackageInFolder(request: ShowPackageRequest): Promise<void> {
+  if (!request?.targetDir) {
+    throw new Error('A download directory is required.');
+  }
+
+  const packageDir = resolvePackageTargetDir(request.targetDir, request.packageId);
+  await showItemInFolder(packageDir);
 }
 
 async function findExistingAncestor(targetDir: string): Promise<string> {
@@ -475,13 +657,14 @@ async function verifySession(request: AuthVerifySessionRequest): Promise<{ valid
 }
 
 async function scanDownloadDirectory(request: ScanDownloadRequest): Promise<unknown[]> {
-  if (!request?.targetDir || !Array.isArray(request.files)) {
-    throw new Error('A download directory and file list are required.');
+  if (!request?.targetDir || !Number.isFinite(Number(request.packageId)) || !Array.isArray(request.files)) {
+    throw new Error('A download directory, package id, and file list are required.');
   }
 
+  const packageTargetDir = resolvePackageTargetDir(request.targetDir, Number(request.packageId));
   return Promise.all(request.files.map(async (file) => {
     try {
-      const filePath = resolveInside(request.targetDir, file.downloadAlias);
+      const filePath = resolveInside(packageTargetDir, file.downloadAlias);
       const fileStat = await stat(filePath);
       return {
         packageFileId: file.packageFileId,
@@ -512,11 +695,6 @@ async function runDownloadJob(job: DownloadJob): Promise<void> {
   const { files, fileConcurrency = DEFAULT_FILE_CONCURRENCY } = job.request;
 
   try {
-    await mkdir(job.request.targetDir, { recursive: true });
-    await refreshJobAuthToken(job);
-    await verifySessionForJob(job);
-    startDownloadHeartbeat(job);
-
     for (const file of files) {
       sendDownloadEvent(job, {
         packageFileId: file.packageFileId,
@@ -527,7 +705,17 @@ async function runDownloadJob(job: DownloadJob): Promise<void> {
       });
     }
 
+    sendDownloadEvent(job, { status: 'queued', message: 'Checking disk space.' });
+    await withTimeout(checkDownloadDiskSpace(job), DISK_SPACE_TIMEOUT_MS, 'Checking disk space timed out before the download could start.');
+
+    const packageTargetDir = resolvePackageTargetDir(job.request.targetDir, job.request.packageId);
+    await mkdir(packageTargetDir, { recursive: true });
+    sendDownloadEvent(job, { status: 'fetching-token', message: 'Preparing downloads.' });
+    startDownloadHeartbeat(job);
+
     await runLimited(files, clamp(fileConcurrency, 1, 6), async (file) => {
+      await waitForResume(job);
+
       if (job.abortController.signal.aborted) {
         throw new Error('Download cancelled.');
       }
@@ -540,10 +728,100 @@ async function runDownloadJob(job: DownloadJob): Promise<void> {
     const message = error instanceof Error ? error.message : 'Download failed.';
     sendDownloadEvent(job, { status: job.abortController.signal.aborted ? 'cancelled' : 'error', message });
   } finally {
+    job.paused = false;
+    releasePauseWaiters(job);
+    job.activeFiles.clear();
+
     if (job.heartbeatTimer) {
       clearInterval(job.heartbeatTimer);
       job.heartbeatTimer = null;
     }
+  }
+}
+
+async function checkDownloadDiskSpace(job: DownloadJob): Promise<void> {
+  const requiredBytes = job.request.files.reduce((total, file) => total + Math.max(file.fileSize, 0), 0);
+  const space = await getAvailableSpace(job.request.targetDir);
+
+  if (space.availableBytes >= requiredBytes) {
+    return;
+  }
+
+  throw new Error(
+    `Not enough disk space in ${job.request.targetDir}. ` +
+    `Required ${formatBytes(requiredBytes)}, available ${formatBytes(space.availableBytes)}.`
+  );
+}
+
+function pauseDownloadJob(job: DownloadJob): void {
+  if (job.paused || job.abortController.signal.aborted) {
+    return;
+  }
+
+  job.paused = true;
+  sendDownloadEvent(job, { status: 'paused', isPaused: true, message: 'Download paused.' });
+
+  for (const file of job.activeFiles.values()) {
+    sendDownloadEvent(job, {
+      packageFileId: file.packageFileId,
+      downloadAlias: file.downloadAlias,
+      status: 'paused',
+      isPaused: true,
+      totalBytes: file.fileSize,
+      message: 'Paused.'
+    });
+  }
+}
+
+function resumeDownloadJob(job: DownloadJob): void {
+  if (!job.paused || job.abortController.signal.aborted) {
+    return;
+  }
+
+  job.paused = false;
+  releasePauseWaiters(job);
+  sendDownloadEvent(job, { status: 'downloading', isPaused: false, message: 'Download resumed.' });
+
+  for (const file of job.activeFiles.values()) {
+    sendDownloadEvent(job, {
+      packageFileId: file.packageFileId,
+      downloadAlias: file.downloadAlias,
+      status: 'downloading',
+      isPaused: false,
+      totalBytes: file.fileSize,
+      message: 'Resumed.'
+    });
+  }
+}
+
+function waitForResume(job: DownloadJob): Promise<void> {
+  if (job.abortController.signal.aborted) {
+    return Promise.reject(new Error('Download cancelled.'));
+  }
+
+  if (!job.paused) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve, reject) => {
+    const resolveWhenReady = () => {
+      job.abortController.signal.removeEventListener('abort', rejectWhenCancelled);
+      resolve();
+    };
+    const rejectWhenCancelled = () => {
+      job.pauseWaiters = job.pauseWaiters.filter((waiter) => waiter !== resolveWhenReady);
+      reject(new Error('Download cancelled.'));
+    };
+
+    job.pauseWaiters.push(resolveWhenReady);
+    job.abortController.signal.addEventListener('abort', rejectWhenCancelled, { once: true });
+  });
+}
+
+function releasePauseWaiters(job: DownloadJob): void {
+  const waiters = job.pauseWaiters.splice(0);
+  for (const waiter of waiters) {
+    waiter();
   }
 }
 
@@ -553,14 +831,21 @@ function startDownloadHeartbeat(job: DownloadJob): void {
   }
 
   job.heartbeatTimer = setInterval(() => {
-    void refreshJobAuthToken(job)
-      .then(() => verifySessionForJob(job))
+    void keepDownloadSessionAlive(job)
       .catch((error) => {
         const message = error instanceof Error ? error.message : 'Session heartbeat failed.';
         sendDownloadEvent(job, { status: 'error', message });
         job.abortController.abort();
       });
   }, HEARTBEAT_INTERVAL_MS);
+}
+
+async function keepDownloadSessionAlive(job: DownloadJob): Promise<void> {
+  if (!job.request.sessionId) {
+    return;
+  }
+
+  await verifySessionForJob(job);
 }
 
 async function refreshJobAuthToken(job: DownloadJob): Promise<void> {
@@ -577,7 +862,6 @@ async function refreshJobAuthToken(job: DownloadJob): Promise<void> {
   }
 
   job.request.authToken = token;
-  sendDownloadEvent(job, { status: 'heartbeat', message: 'Authentication token refreshed.' });
 }
 
 async function verifySessionForJob(job: DownloadJob): Promise<void> {
@@ -605,105 +889,254 @@ async function verifySessionForJob(job: DownloadJob): Promise<void> {
     throw new Error(body.errorMessage || 'Session is invalid or expired.');
   }
 
-  sendDownloadEvent(job, { status: 'heartbeat', message: 'Session verified.' });
 }
 
 async function downloadOneFile(job: DownloadJob, file: NativeFileInput): Promise<void> {
-  const finalPath = resolveInside(job.request.targetDir, file.downloadAlias);
-  await mkdir(path.dirname(finalPath), { recursive: true });
+  job.activeFiles.set(file.packageFileId, file);
 
-  const existing = await statIfExists(finalPath);
-  if (existing && file.fileSize > 0 && existing.size === file.fileSize) {
+  try {
+    const finalPath = resolveInside(resolvePackageTargetDir(job.request.targetDir, job.request.packageId), file.downloadAlias);
+    await mkdir(path.dirname(finalPath), { recursive: true });
+
+    const existing = await statIfExists(finalPath);
+    if (existing && file.fileSize > 0 && existing.size === file.fileSize) {
+      sendDownloadEvent(job, {
+        packageFileId: file.packageFileId,
+        downloadAlias: file.downloadAlias,
+        status: 'skipped',
+        receivedBytes: existing.size,
+        totalBytes: file.fileSize,
+        path: finalPath,
+        message: 'Already downloaded.'
+      });
+      return;
+    }
+
+    await waitForResume(job);
     sendDownloadEvent(job, {
       packageFileId: file.packageFileId,
       downloadAlias: file.downloadAlias,
-      status: 'skipped',
-      receivedBytes: existing.size,
+      status: 'fetching-token',
+      receivedBytes: 0,
       totalBytes: file.fileSize,
-      path: finalPath,
-      message: 'Already downloaded.'
+      message: ''
     });
-    return;
-  }
 
-  sendDownloadEvent(job, {
-    packageFileId: file.packageFileId,
-    downloadAlias: file.downloadAlias,
-    status: 'fetching-token',
-    receivedBytes: 0,
-    totalBytes: file.fileSize
-  });
-
-  const downloadToken = await fetchDownloadToken(job, file);
-  const s3Location = parseS3Uri(downloadToken.source_uri);
-  const client = new S3Client({
-    region: DEFAULT_AWS_REGION,
-    credentials: {
-      accessKeyId: downloadToken.access_key,
-      secretAccessKey: downloadToken.secret_key,
-      sessionToken: downloadToken.session_token
-    },
-    requestHandler: new (await import('@smithy/node-http-handler')).NodeHttpHandler({
-      httpsAgent: new https.Agent({
-        keepAlive: true,
-        maxSockets: Math.max(16, (job.request.chunkConcurrency || DEFAULT_CHUNK_CONCURRENCY) * 4)
+    const downloadToken = await fetchDownloadToken(job, file);
+    await waitForResume(job);
+    const s3Location = parseS3Uri(downloadToken.source_uri);
+    const client = new S3Client({
+      region: DEFAULT_AWS_REGION,
+      credentials: {
+        accessKeyId: downloadToken.access_key,
+        secretAccessKey: downloadToken.secret_key,
+        sessionToken: downloadToken.session_token
+      },
+      requestHandler: new (await import('@smithy/node-http-handler')).NodeHttpHandler({
+        httpsAgent: new https.Agent({
+          keepAlive: true,
+          maxSockets: Math.max(16, (job.request.chunkConcurrency || DEFAULT_CHUNK_CONCURRENCY) * 4)
+        })
       })
-    })
-  });
+    });
 
-  const totalBytes = file.fileSize > 0
-    ? file.fileSize
-    : await fetchObjectSize(client, s3Location.bucket, s3Location.key, job.abortController.signal);
+    const totalBytes = file.fileSize > 0
+      ? file.fileSize
+      : await fetchObjectSize(client, s3Location.bucket, s3Location.key, job.abortController.signal);
 
-  const tempPath = `${finalPath}.part`;
-  await rm(tempPath, { force: true });
+    const tempPath = `${finalPath}.part`;
+    await waitForResume(job);
+    await rm(tempPath, { force: true });
 
-  sendDownloadEvent(job, {
-    packageFileId: file.packageFileId,
-    downloadAlias: file.downloadAlias,
-    status: 'downloading',
-    receivedBytes: 0,
-    totalBytes,
-    path: finalPath
-  });
+    sendDownloadEvent(job, {
+      packageFileId: file.packageFileId,
+      downloadAlias: file.downloadAlias,
+      status: 'downloading',
+      receivedBytes: 0,
+      totalBytes,
+      path: finalPath
+    });
 
-  if (totalBytes === 0) {
-    const handle = await open(tempPath, 'w');
-    await handle.close();
-  } else {
-    await downloadS3Object(job, client, s3Location.bucket, s3Location.key, tempPath, file, totalBytes);
+    if (totalBytes === 0) {
+      await waitForResume(job);
+      const handle = await open(tempPath, 'w');
+      await handle.close();
+    } else {
+      await downloadS3Object(job, client, s3Location.bucket, s3Location.key, tempPath, file, totalBytes);
+    }
+
+    await waitForResume(job);
+    await rm(finalPath, { force: true });
+    await rename(tempPath, finalPath);
+
+    sendDownloadEvent(job, {
+      packageFileId: file.packageFileId,
+      downloadAlias: file.downloadAlias,
+      status: 'complete',
+      receivedBytes: totalBytes,
+      totalBytes,
+      path: finalPath
+    });
+  } catch (error) {
+    if (!job.abortController.signal.aborted) {
+      sendDownloadEvent(job, {
+        packageFileId: file.packageFileId,
+        downloadAlias: file.downloadAlias,
+        status: 'error',
+        totalBytes: file.fileSize,
+        message: error instanceof Error ? error.message : 'Download failed.'
+      });
+    }
+
+    throw error;
+  } finally {
+    job.activeFiles.delete(file.packageFileId);
   }
-
-  await rm(finalPath, { force: true });
-  await rename(tempPath, finalPath);
-
-  sendDownloadEvent(job, {
-    packageFileId: file.packageFileId,
-    downloadAlias: file.downloadAlias,
-    status: 'complete',
-    receivedBytes: totalBytes,
-    totalBytes,
-    path: finalPath
-  });
 }
 
 async function fetchDownloadToken(job: DownloadJob, file: NativeFileInput): Promise<DownloadTokenResponse> {
-  await refreshJobAuthToken(job);
+  let response = await requestDownloadToken(job, file);
+  if (!response.ok && shouldRefreshAuthBeforeRetry(response.status)) {
+    await refreshJobAuthToken(job);
+    await verifySessionForJob(job);
+    response = await requestDownloadToken(job, file);
+  }
 
+  if (!response.ok) {
+    const detail = await response.text().catch(() => '');
+    if (shouldRetryAfterSessionError(response.status, detail) && job.request.sessionId) {
+      await refreshJobAuthToken(job);
+      await verifySessionForJob(job);
+      const retry = await requestDownloadToken(job, file);
+      if (retry.ok) {
+        const retryPayload = await retry.json().catch(() => {
+          throw new Error(`Download token response for ${file.downloadAlias} was not valid JSON.`);
+        });
+        return normalizeDownloadTokenResponse(retryPayload, file);
+      }
+
+      const retryDetail = await retry.text().catch(() => '');
+      throw new Error(`Download token failed for ${file.downloadAlias}: HTTP ${retry.status}${retryDetail ? ` ${retryDetail}` : ''}`);
+    }
+
+    throw new Error(`Download token failed for ${file.downloadAlias}: HTTP ${response.status}${detail ? ` ${detail}` : ''}`);
+  }
+
+  const payload = await response.json().catch(() => {
+    throw new Error(`Download token response for ${file.downloadAlias} was not valid JSON.`);
+  });
+  return normalizeDownloadTokenResponse(payload, file);
+}
+
+function requestDownloadToken(job: DownloadJob, file: NativeFileInput): Promise<Response> {
   const url = `${trimTrailingSlash(job.request.host)}/api/package/${job.request.packageId}/files/${file.packageFileId}/download_token`;
-  const response = await fetch(url, {
+  return fetch(url, {
     headers: {
       Authorization: `Bearer ${job.request.authToken}`
     },
     signal: job.abortController.signal
   });
+}
 
-  if (!response.ok) {
-    const detail = await response.text().catch(() => '');
-    throw new Error(`Download token failed for ${file.downloadAlias}: HTTP ${response.status}${detail ? ` ${detail}` : ''}`);
+function shouldRefreshAuthBeforeRetry(status: number): boolean {
+  return status === 401 || status === 403;
+}
+
+function shouldRetryAfterSessionError(status: number, detail: string): boolean {
+  const normalized = detail.toLowerCase();
+  return status >= 400 && (
+    normalized.includes('session') ||
+    normalized.includes('expired') ||
+    normalized.includes('unauthorized') ||
+    normalized.includes('token')
+  );
+}
+
+function normalizeDownloadTokenResponse(payload: unknown, file: NativeFileInput): DownloadTokenResponse {
+  if (!payload || typeof payload !== 'object') {
+    throw new Error(`Download token response for ${file.downloadAlias} was empty or malformed.`);
   }
 
-  return response.json() as Promise<DownloadTokenResponse>;
+  const record = payload as Record<string, unknown>;
+  return {
+    package_file_id: readNumber(record, 'package_file_id', file.packageFileId),
+    download_alias: readString(record, 'download_alias', file.downloadAlias),
+    access_key: readRequiredString(record, 'access_key', 'access key', file),
+    secret_key: readRequiredString(record, 'secret_key', 'secret key', file),
+    session_token: readRequiredString(record, 'session_token', 'session token', file),
+    expiration_date: readString(record, 'expiration_date', ''),
+    destination_uri: readNullableString(record, 'destination_uri'),
+    source_uri: readRequiredString(record, 'source_uri', 'source uri', file)
+  };
+}
+
+function readRequiredString(
+  record: Record<string, unknown>,
+  key: string,
+  label: string,
+  file: NativeFileInput
+): string {
+  const value = readString(record, key, '');
+  if (!value) {
+    throw new Error(`Download token response for ${file.downloadAlias} is missing ${label}.`);
+  }
+
+  return value;
+}
+
+function readString(record: Record<string, unknown>, key: string, fallback: string): string {
+  const value = record[key];
+  if (typeof value === 'string') {
+    return value.trim();
+  }
+
+  return fallback;
+}
+
+function readNullableString(record: Record<string, unknown>, key: string): string | null {
+  const value = readString(record, key, '');
+  return value || null;
+}
+
+function readNumber(record: Record<string, unknown>, key: string, fallback: number): number {
+  const value = record[key];
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value === 'string') {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+
+  return fallback;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes === 0) {
+    return '0 B';
+  }
+
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const exponent = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  const value = bytes / Math.pow(1024, exponent);
+  return `${value.toFixed(value >= 10 || exponent === 0 ? 0 : 1)} ${units[exponent]}`;
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: NodeJS.Timeout | null = null;
+
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  });
 }
 
 async function downloadS3Object(
@@ -723,6 +1156,8 @@ async function downloadS3Object(
   const emitProgress = createProgressEmitter(job, file, totalBytes);
 
   await runLimited(chunks, clamp(job.request.chunkConcurrency || DEFAULT_CHUNK_CONCURRENCY, 1, 8), async (chunk) => {
+    await waitForResume(job);
+
     if (job.abortController.signal.aborted) {
       throw new Error('Download cancelled.');
     }
@@ -741,7 +1176,7 @@ async function downloadS3Object(
       start: chunk.start
     });
 
-    await pipeline(body, writeStream, { signal: job.abortController.signal });
+    await pipeline(body, createPauseGate(job), writeStream, { signal: job.abortController.signal });
   });
 }
 
@@ -775,6 +1210,16 @@ function createProgressEmitter(job: DownloadJob, file: NativeFileInput, totalByt
       totalBytes
     });
   };
+}
+
+function createPauseGate(job: DownloadJob): Transform {
+  return new Transform({
+    transform(chunk, _encoding, callback) {
+      void waitForResume(job)
+        .then(() => callback(null, chunk))
+        .catch((error) => callback(error instanceof Error ? error : new Error('Download cancelled.')));
+    }
+  });
 }
 
 function sendDownloadEvent(job: DownloadJob, event: Omit<DownloadEvent, 'jobId' | 'packageId' | 'packageName'>): void {
@@ -845,12 +1290,34 @@ function validateDownloadStartRequest(request: DownloadStartRequest): void {
     throw new Error('An authentication token is required.');
   }
 
+  request.packageId = Number(request.packageId);
+  if (!Number.isFinite(request.packageId)) {
+    throw new Error('A valid package id is required.');
+  }
+
   if (!request.targetDir) {
     throw new Error('A download directory is required.');
   }
 
   if (!Array.isArray(request.files) || request.files.length === 0) {
     throw new Error('At least one file is required.');
+  }
+
+  for (const file of request.files) {
+    file.packageFileId = Number(file.packageFileId);
+    file.fileSize = Number(file.fileSize);
+
+    if (!Number.isFinite(file.packageFileId)) {
+      throw new Error(`A valid package file id is required for ${file.downloadAlias || 'the selected file'}.`);
+    }
+
+    if (!file.downloadAlias) {
+      throw new Error(`A download alias is required for file ${file.packageFileId}.`);
+    }
+
+    if (!Number.isFinite(file.fileSize)) {
+      file.fileSize = 0;
+    }
   }
 }
 
@@ -874,6 +1341,15 @@ function resolveInside(baseDir: string, relativeName: string): string {
   }
 
   return candidate;
+}
+
+function resolvePackageTargetDir(baseDir: string, packageId: number): string {
+  const normalizedPackageId = Number(packageId);
+  if (!Number.isFinite(normalizedPackageId)) {
+    throw new Error('A valid package id is required.');
+  }
+
+  return resolveInside(baseDir, `package_${Math.trunc(normalizedPackageId)}`);
 }
 
 async function statIfExists(filePath: string): Promise<fs.Stats | null> {

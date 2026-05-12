@@ -15,6 +15,14 @@ export class DownloadService {
     return this.native.startDownloadJob(request);
   }
 
+  pause(jobId: string): Promise<void> {
+    return this.native.pauseDownloadJob(jobId);
+  }
+
+  resume(jobId: string): Promise<void> {
+    return this.native.resumeDownloadJob(jobId);
+  }
+
   cancel(jobId: string): Promise<void> {
     return this.native.cancelDownloadJob(jobId);
   }

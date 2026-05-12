@@ -60,6 +60,8 @@ export class AppComponent implements OnInit, OnDestroy {
 
   private readonly destroyed$ = new Subject<void>();
   private readonly latestJobEvents = new Map<string, DownloadEvent>();
+  private readonly jobFileIds = new Map<string, Set<number>>();
+  private readonly pausedJobIds = new Set<string>();
   private completingSessionId: string | null = null;
   private readonly clearAuthCacheOnExit = () => this.auth.clearAuthCache();
 
@@ -96,7 +98,10 @@ export class AppComponent implements OnInit, OnDestroy {
     this.downloads.events$
       .pipe(takeUntil(this.destroyed$))
       .subscribe((event) => {
-        this.zone.run(() => this.handleDownloadEvent(event));
+        this.zone.run(() => {
+          this.handleDownloadEvent(event);
+          this.changeDetector.detectChanges();
+        });
       });
 
     if (this.authState.authenticated) {
@@ -127,6 +132,10 @@ export class AppComponent implements OnInit, OnDestroy {
     return this.files
       .filter((file) => file.selected)
       .reduce((total, file) => total + file.file_size, 0);
+  }
+
+  get downloadInProgress(): boolean {
+    return this.startingDownload || this.jobRows.some((job) => !this.isTerminalJob(job));
   }
 
   async startSignIn(): Promise<void> {
@@ -181,14 +190,40 @@ export class AppComponent implements OnInit, OnDestroy {
   }
 
   signOut(): void {
+    for (const job of this.jobRows) {
+      if (!this.isTerminalJob(job)) {
+        void this.downloads.cancel(job.jobId);
+      }
+    }
+
     this.auth.signOut();
     this.packages.clearFileCache();
+    this.activeTab = 'mine';
     this.myPackages = [];
     this.sharedPackages = [];
     this.selectedPackage = null;
     this.files = [];
+    this.jobRows = [];
+    this.latestJobEvents.clear();
+    this.jobFileIds.clear();
+    this.pausedJobIds.clear();
+    this.showHelp = false;
+    this.helpForm = {
+      name: '',
+      username: '',
+      email: '',
+      message: ''
+    };
+    this.loadingAuth = false;
+    this.loadingPackages = false;
     this.initialPackageLoad = false;
-    this.infoMessage = 'Signed out.';
+    this.loadingFiles = false;
+    this.scanning = false;
+    this.associatingPackageId = null;
+    this.startingDownload = false;
+    this.sendingHelp = false;
+    this.completingSessionId = null;
+    this.clearMessages();
   }
 
   async refreshPackages(state: AuthState = this.authState): Promise<void> {
@@ -296,6 +331,7 @@ export class AppComponent implements OnInit, OnDestroy {
         localStatus: 'unknown',
         localSize: null,
         localModifiedAt: null,
+        localPath: null,
         downloadStatus: null,
         receivedBytes: 0,
         totalBytes: file.file_size,
@@ -351,7 +387,7 @@ export class AppComponent implements OnInit, OnDestroy {
   }
 
   async scanDownloads(): Promise<void> {
-    if (!this.downloadDirectory || this.files.length === 0) {
+    if (!this.downloadDirectory || !this.selectedPackage || this.files.length === 0) {
       return;
     }
 
@@ -360,6 +396,7 @@ export class AppComponent implements OnInit, OnDestroy {
     try {
       const results = await this.native.scanDownloadDirectory({
         targetDir: this.downloadDirectory,
+        packageId: this.selectedPackage.id,
         files: this.files.map((file) => toNativeFile(file))
       });
       const byFileId = new Map(results.map((result) => [result.packageFileId, result]));
@@ -367,20 +404,32 @@ export class AppComponent implements OnInit, OnDestroy {
       this.files = this.files.map((file) => {
         const result = byFileId.get(file.package_file_id);
         if (!result) {
-          return file;
+          return {
+            ...file,
+            localStatus: 'missing',
+            localSize: null,
+            localModifiedAt: null,
+            localPath: null
+          };
         }
 
+        const downloaded = result.exists && result.complete;
         return {
           ...file,
           localStatus: result.exists ? (result.complete ? 'downloaded' : 'partial') : 'missing',
           localSize: result.size,
-          localModifiedAt: result.modifiedAt
+          localModifiedAt: result.modifiedAt,
+          localPath: downloaded ? result.path : null,
+          downloadStatus: downloaded ? 'complete' : file.downloadStatus === 'downloading' || file.downloadStatus === 'fetching-token' || file.downloadStatus === 'queued'
+            ? file.downloadStatus
+            : null
         };
       });
     } catch (error) {
       this.errorMessage = errorMessage(error);
     } finally {
       this.scanning = false;
+      this.changeDetector.detectChanges();
     }
   }
 
@@ -401,8 +450,92 @@ export class AppComponent implements OnInit, OnDestroy {
     await this.startDownload(this.files);
   }
 
+  canShowFile(file: UiFile): boolean {
+    return file.localStatus === 'downloaded' && Boolean(file.localPath);
+  }
+
+  canShowPackageDownload(): boolean {
+    return Boolean(this.selectedPackage)
+      && this.files.length > 0
+      && this.files.every((file) => this.canShowFile(file));
+  }
+
+  async showFileInFolder(file: UiFile): Promise<void> {
+    try {
+      await this.scanDownloads();
+      const current = this.files.find((item) => item.package_file_id === file.package_file_id);
+      if (!current || !this.canShowFile(current) || !current.localPath) {
+        return;
+      }
+
+      await this.native.showItemInFolder(current.localPath);
+    } catch (error) {
+      this.errorMessage = errorMessage(error);
+    }
+  }
+
+  async showPackageInFolder(): Promise<void> {
+    if (!this.downloadDirectory || !this.selectedPackage) {
+      return;
+    }
+
+    try {
+      await this.scanDownloads();
+      if (!this.canShowPackageDownload()) {
+        return;
+      }
+
+      await this.native.showPackageInFolder({
+        targetDir: this.downloadDirectory,
+        packageId: this.selectedPackage.id
+      });
+    } catch (error) {
+      this.errorMessage = errorMessage(error);
+    }
+  }
+
   async cancelJob(jobId: string): Promise<void> {
     await this.downloads.cancel(jobId);
+  }
+
+  async pauseJob(jobId: string): Promise<void> {
+    try {
+      await this.downloads.pause(jobId);
+    } catch (error) {
+      this.errorMessage = errorMessage(error);
+    }
+  }
+
+  async resumeJob(jobId: string): Promise<void> {
+    try {
+      await this.downloads.resume(jobId);
+    } catch (error) {
+      this.errorMessage = errorMessage(error);
+    }
+  }
+
+  isJobPaused(job: DownloadEvent): boolean {
+    return this.pausedJobIds.has(job.jobId);
+  }
+
+  isTerminalJob(job: DownloadEvent): boolean {
+    return job.status === 'job-complete' || job.status === 'error' || job.status === 'cancelled';
+  }
+
+  canPauseJob(job: DownloadEvent): boolean {
+    return this.isDesktop && !this.isTerminalJob(job) && !this.isJobPaused(job);
+  }
+
+  canResumeJob(job: DownloadEvent): boolean {
+    return this.isDesktop && !this.isTerminalJob(job) && this.isJobPaused(job);
+  }
+
+  canCancelJob(job: DownloadEvent): boolean {
+    return this.isDesktop && !this.isTerminalJob(job);
+  }
+
+  jobStatusLabel(job: DownloadEvent): string {
+    return this.isJobPaused(job) ? 'paused' : job.status;
   }
 
   openHelp(): void {
@@ -469,9 +602,29 @@ export class AppComponent implements OnInit, OnDestroy {
     }).format(new Date(value));
   }
 
+  formatDateOnly(value: string | null | undefined): string {
+    if (!value) {
+      return 'Unknown';
+    }
+
+    return new Intl.DateTimeFormat(undefined, {
+      year: 'numeric',
+      month: 'short',
+      day: '2-digit'
+    }).format(new Date(value));
+  }
+
   localStatusLabel(file: UiFile): string {
+    if (file.downloadStatus === 'paused') {
+      return 'Paused';
+    }
+
+    if (file.downloadStatus === 'queued') {
+      return 'Queued';
+    }
+
     if (file.downloadStatus === 'downloading') {
-      return 'Downloading';
+      return 'Downloading...';
     }
 
     if (file.downloadStatus === 'fetching-token') {
@@ -496,6 +649,30 @@ export class AppComponent implements OnInit, OnDestroy {
       default:
         return 'Unknown';
     }
+  }
+
+  isFileDownloadActive(file: UiFile): boolean {
+    return file.downloadStatus === 'queued'
+      || file.downloadStatus === 'fetching-token'
+      || file.downloadStatus === 'downloading';
+  }
+
+  isFileDownloadComplete(file: UiFile): boolean {
+    return file.downloadStatus === 'complete'
+      || file.downloadStatus === 'skipped'
+      || file.localStatus === 'downloaded';
+  }
+
+  downloadIndicatorLabel(file: UiFile): string {
+    if (this.isFileDownloadComplete(file)) {
+      return 'Download complete';
+    }
+
+    if (this.isFileDownloadActive(file)) {
+      return 'Download in progress';
+    }
+
+    return 'Not downloaded';
   }
 
   progressPercent(file: UiFile): number {
@@ -537,36 +714,57 @@ export class AppComponent implements OnInit, OnDestroy {
       return;
     }
 
+    if (this.downloadInProgress) {
+      this.errorMessage = 'A download is already in progress.';
+      return;
+    }
+
+    let nativeFiles: NativeFileInput[];
+    try {
+      nativeFiles = files.map((file) => toNativeFile(file));
+      validatePackageId(this.selectedPackage.id, this.selectedPackage.name);
+    } catch (error) {
+      this.errorMessage = errorMessage(error);
+      return;
+    }
+
     this.startingDownload = true;
+    this.infoMessage = `Preparing ${files.length} file${files.length === 1 ? '' : 's'} for download.`;
+    this.files = this.files.map((file) => files.some((selected) => selected.package_file_id === file.package_file_id)
+      ? {
+          ...file,
+          downloadStatus: 'queued',
+          receivedBytes: 0,
+          totalBytes: file.file_size,
+          errorMessage: null
+        }
+      : file);
 
     try {
-      await this.ensureEnoughDiskSpace(files);
-      const currentAuth = await this.auth.refreshToken();
-      if (!currentAuth.token) {
-        throw new Error('Sign in is required.');
-      }
-
-      const result = await this.downloads.start({
-        host: currentAuth.host,
-        authToken: currentAuth.token,
-        sessionId: currentAuth.sessionId,
+      const startMessage = formatDownloadStartMessage(files, this.selectedPackage.id);
+      this.infoMessage = startMessage;
+      const result = await withTimeout(this.downloads.start({
+        host: this.authState.host,
+        authToken: this.authState.token,
+        sessionId: this.authState.sessionId,
         packageId: this.selectedPackage.id,
         packageName: this.selectedPackage.name,
         targetDir: this.downloadDirectory,
-        files: files.map((file) => toNativeFile(file)),
+        files: nativeFiles,
         fileConcurrency: 2,
         chunkConcurrency: 4
-      });
+      }), 15000, 'Starting the download job timed out before Electron acknowledged it.');
 
+      this.jobFileIds.set(result.jobId, new Set(nativeFiles.map((file) => file.packageFileId)));
       this.latestJobEvents.set(result.jobId, {
         jobId: result.jobId,
         packageId: this.selectedPackage.id,
         packageName: this.selectedPackage.name,
         status: 'queued',
-        message: `${files.length} file${files.length === 1 ? '' : 's'} queued.`
+        message: startMessage
       });
       this.syncJobRows();
-      this.infoMessage = 'Download started.';
+      this.infoMessage = startMessage;
     } catch (error) {
       this.errorMessage = errorMessage(error);
     } finally {
@@ -593,21 +791,13 @@ export class AppComponent implements OnInit, OnDestroy {
     }
   }
 
-  private async ensureEnoughDiskSpace(files: UiFile[]): Promise<void> {
-    const requiredBytes = files.reduce((total, file) => total + file.file_size, 0);
-    const space = await this.native.getAvailableSpace(this.downloadDirectory);
-
-    if (space.availableBytes >= requiredBytes) {
-      return;
+  private handleDownloadEvent(event: DownloadEvent): void {
+    if (event.isPaused === true) {
+      this.pausedJobIds.add(event.jobId);
+    } else if (event.isPaused === false || event.status === 'job-complete' || event.status === 'error' || event.status === 'cancelled') {
+      this.pausedJobIds.delete(event.jobId);
     }
 
-    throw new Error(
-      `Not enough disk space in ${this.downloadDirectory}. ` +
-      `Required ${this.formatBytes(requiredBytes)}, available ${this.formatBytes(space.availableBytes)}.`
-    );
-  }
-
-  private handleDownloadEvent(event: DownloadEvent): void {
     const previous = this.latestJobEvents.get(event.jobId);
     this.latestJobEvents.set(event.jobId, {
       ...previous,
@@ -615,31 +805,73 @@ export class AppComponent implements OnInit, OnDestroy {
     });
     this.syncJobRows();
 
-    if (event.packageFileId) {
+    if (event.packageFileId !== undefined) {
       this.files = this.files.map((file) => {
         if (file.package_file_id !== event.packageFileId) {
           return file;
         }
 
+        const completed = event.status === 'complete' || event.status === 'skipped';
+        const totalBytes = event.totalBytes ?? file.totalBytes ?? file.file_size;
+
         return {
           ...file,
           downloadStatus: event.status,
-          receivedBytes: event.receivedBytes ?? file.receivedBytes,
-          totalBytes: event.totalBytes ?? file.totalBytes,
-          localStatus: event.status === 'complete' || event.status === 'skipped' ? 'downloaded' : file.localStatus,
-          localSize: event.status === 'complete' || event.status === 'skipped' ? (event.totalBytes ?? file.file_size) : file.localSize,
+          receivedBytes: completed ? totalBytes : event.receivedBytes ?? file.receivedBytes,
+          totalBytes,
+          localStatus: completed ? 'downloaded' : file.localStatus,
+          localSize: completed ? totalBytes : file.localSize,
+          localPath: completed ? (event.path ?? file.localPath) : file.localPath,
           errorMessage: event.status === 'error' ? event.message || 'Download failed.' : file.errorMessage
         };
       });
     }
 
+    if (event.status === 'error') {
+      this.jobFileIds.delete(event.jobId);
+      this.errorMessage = event.message || 'Download failed.';
+    }
+
+    if (event.status === 'cancelled') {
+      this.jobFileIds.delete(event.jobId);
+      this.infoMessage = event.message || 'Download cancelled.';
+    }
+
     if (event.status === 'job-complete') {
+      const completedFileIds = this.jobFileIds.get(event.jobId);
+      if (completedFileIds) {
+        this.files = this.files.map((file) => {
+          if (!completedFileIds.has(file.package_file_id)) {
+            return file;
+          }
+
+          const totalBytes = file.totalBytes || file.file_size;
+          return {
+            ...file,
+            downloadStatus: 'complete',
+            receivedBytes: totalBytes,
+            totalBytes,
+            localStatus: 'downloaded',
+            localSize: totalBytes,
+            localPath: file.localPath,
+            errorMessage: null
+          };
+        });
+        this.jobFileIds.delete(event.jobId);
+      }
+
+      this.latestJobEvents.delete(event.jobId);
+      this.syncJobRows();
+      this.infoMessage = null;
       void this.scanDownloads();
     }
   }
 
   private syncJobRows(): void {
-    this.jobRows = Array.from(this.latestJobEvents.values()).reverse().slice(0, 8);
+    this.jobRows = Array.from(this.latestJobEvents.values())
+      .filter((job) => job.status !== 'job-complete')
+      .reverse()
+      .slice(0, 8);
   }
 
   private clearMessages(): void {
@@ -649,9 +881,11 @@ export class AppComponent implements OnInit, OnDestroy {
 }
 
 function normalizeMyPackage(item: MyPackageDto): UiPackage {
+  const id = normalizeNumericId(item.package_id, 'package id');
+
   return {
-    id: item.package_id,
-    name: item.description || `Package ${item.package_id}`,
+    id,
+    name: item.description || `Package ${id}`,
     description: item.source_package_description || item.description || '',
     fileCount: item.file_count,
     fileSize: item.total_package_size,
@@ -663,8 +897,10 @@ function normalizeMyPackage(item: MyPackageDto): UiPackage {
 }
 
 function normalizeSharedPackage(item: SharedPackageDto): UiPackage {
+  const id = normalizeNumericId(item.packageId, 'shared package id');
+
   return {
-    id: item.packageId,
+    id,
     name: item.packageName,
     description: item.packageDescription,
     fileCount: item.fileCount,
@@ -675,12 +911,59 @@ function normalizeSharedPackage(item: SharedPackageDto): UiPackage {
   };
 }
 
+function normalizeNumericId(value: unknown, label: string): number {
+  const id = Number(value);
+  if (!Number.isFinite(id)) {
+    throw new Error(`Package response is missing ${label}.`);
+  }
+
+  return id;
+}
+
 function toNativeFile(file: UiFile): NativeFileInput {
+  const packageFileId = Number(file.package_file_id);
+  const fileSize = Number(file.file_size);
+
+  if (!Number.isFinite(packageFileId)) {
+    throw new Error(`File ${file.download_alias || 'selected file'} is missing a package file id.`);
+  }
+
+  if (!file.download_alias) {
+    throw new Error(`File ${packageFileId} is missing a download alias.`);
+  }
+
   return {
-    packageFileId: file.package_file_id,
+    packageFileId,
     downloadAlias: file.download_alias,
-    fileSize: file.file_size
+    fileSize: Number.isFinite(fileSize) ? fileSize : 0
   };
+}
+
+function validatePackageId(packageId: number, packageName: string): void {
+  if (!Number.isFinite(Number(packageId))) {
+    throw new Error(`Package ${packageName || 'selected package'} is missing a package id.`);
+  }
+}
+
+function formatDownloadStartMessage(files: UiFile[], packageId: number): string {
+  const fileName = files.length === 1
+    ? files[0].download_alias
+    : `${files[0].download_alias} and ${files.length - 1} more`;
+  return `Starting to downloading ${fileName} in package ${packageId}...`;
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  });
 }
 
 function errorMessage(error: unknown): string {

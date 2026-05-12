@@ -9,7 +9,11 @@ contextBridge.exposeInMainWorld('ndaDm', {
   getAvailableSpace: (targetDir: string) => ipcRenderer.invoke('fs:get-available-space', targetDir),
   chooseDownloadDirectory: () => ipcRenderer.invoke('fs:choose-directory'),
   scanDownloadDirectory: (request: unknown) => ipcRenderer.invoke('fs:scan-downloads', request),
+  showItemInFolder: (path: string) => ipcRenderer.invoke('fs:show-item', path),
+  showPackageInFolder: (request: unknown) => ipcRenderer.invoke('fs:show-package', request),
   startDownloadJob: (request: unknown) => ipcRenderer.invoke('download:start', request),
+  pauseDownloadJob: (jobId: string) => ipcRenderer.invoke('download:pause', jobId),
+  resumeDownloadJob: (jobId: string) => ipcRenderer.invoke('download:resume', jobId),
   cancelDownloadJob: (jobId: string) => ipcRenderer.invoke('download:cancel', jobId),
   sendHelpRequest: (request: unknown) => ipcRenderer.invoke('help:submit', request),
   onAuthCallback: (callback: (payload: unknown) => void) => {

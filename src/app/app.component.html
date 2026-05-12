@@ -18,17 +18,15 @@
   </section>
 
   <div class="message error" *ngIf="errorMessage">{{ errorMessage }}</div>
-  <div class="message info" *ngIf="infoMessage">{{ infoMessage }}</div>
 </main>
 
-<main class="sign-in-screen" *ngIf="!authState.authenticated && !loadingAuth">
-  <section class="sign-in-panel" aria-labelledby="sign-in-title">
-    <span class="eyebrow">NDA Download Manager</span>
-    <h2 id="sign-in-title">Sign in</h2>
-    <button class="primary" type="button" [disabled]="loadingAuth" (click)="startSignIn()">
-      {{ loadingAuth ? 'Signing in' : 'Sign in with RAS' }}
-    </button>
-  </section>
+  <main class="sign-in-screen" *ngIf="!authState.authenticated && !loadingAuth">
+    <section class="sign-in-panel" aria-label="Sign in">
+      <img class="sign-in-icon" src="ndaicon.ico" alt="" aria-hidden="true">
+      <button class="primary" type="button" [disabled]="loadingAuth" (click)="startSignIn()">
+        {{ loadingAuth ? 'Signing in' : 'Sign in with RAS' }}
+      </button>
+    </section>
 
   <div class="message error" *ngIf="errorMessage">{{ errorMessage }}</div>
   <div class="message info" *ngIf="infoMessage">{{ infoMessage }}</div>
@@ -54,11 +52,6 @@
         <button type="button" [class.active]="activeTab === 'shared'" (click)="activeTab = 'shared'">Shared Packages</button>
       </div>
 
-      <div class="pane-toolbar">
-        <strong>{{ activeTab === 'mine' ? myPackages.length : sharedPackages.length }} packages</strong>
-        <span *ngIf="loadingPackages">Loading</span>
-      </div>
-
       <div class="package-list" *ngIf="activeTab === 'mine'">
         <div class="empty-state" *ngIf="!loadingPackages && myPackages.length === 0">
           No packages.
@@ -72,9 +65,7 @@
           (click)="selectPackage(pkg)"
         >
           <span class="package-title">{{ pkg.name }}</span>
-          <span class="package-meta">{{ pkg.fileCount | number }} files</span>
           <span class="package-meta">{{ formatBytes(pkg.fileSize) }}</span>
-          <span class="package-date">{{ formatDate(pkg.createdDate) }}</span>
         </button>
       </div>
 
@@ -85,16 +76,16 @@
 
         <div class="package-row shared" *ngFor="let pkg of sharedPackages; trackBy: trackPackage">
           <span class="package-title">{{ pkg.name }}</span>
-          <span class="package-meta">{{ pkg.fileCount | number }} files</span>
           <span class="package-meta">{{ formatBytes(pkg.fileSize) }}</span>
-          <p>{{ pkg.description }}</p>
           <button
-            class="secondary"
+            class="package-action"
             type="button"
             [disabled]="associatingPackageId === pkg.id"
+            [attr.aria-label]="'Add ' + pkg.name + ' to My Packages'"
+            title="Add to My Packages"
             (click)="associatePackage(pkg)"
           >
-            {{ associatingPackageId === pkg.id ? 'Adding' : 'Add to My Packages' }}
+            +
           </button>
         </div>
       </div>
@@ -109,8 +100,9 @@
         <div class="file-actions">
           <button class="secondary" type="button" (click)="chooseDownloadDirectory()">Directory</button>
           <button class="secondary" type="button" [disabled]="!downloadDirectory || scanning" (click)="scanDownloads()">Scan</button>
-          <button class="primary" type="button" [disabled]="startingDownload || files.length === 0" (click)="downloadPackage()">Download Package</button>
-          <button class="primary subtle" type="button" [disabled]="startingDownload || selectedFileCount === 0" (click)="downloadSelected()">Download Selected</button>
+          <button class="secondary" type="button" *ngIf="selectedPackage" [disabled]="!canShowPackageDownload() || scanning" (click)="showPackageInFolder()">Show Package</button>
+          <button class="primary" type="button" [disabled]="downloadInProgress || files.length === 0" (click)="downloadPackage()">Download Package</button>
+          <button class="primary subtle" type="button" [disabled]="downloadInProgress || selectedFileCount === 0" (click)="downloadSelected()">Download Selected</button>
         </div>
       </div>
 
@@ -121,11 +113,15 @@
       </div>
 
       <div class="jobs" *ngIf="jobRows.length > 0">
-        <div class="job-row" *ngFor="let job of jobRows">
+        <div class="job-row" *ngFor="let job of jobRows" [class.error]="job.status === 'error'">
           <span>{{ job.packageName }}</span>
-          <strong>{{ job.status }}</strong>
+          <strong>{{ jobStatusLabel(job) }}</strong>
           <span>{{ job.message || job.downloadAlias || '' }}</span>
-          <button *ngIf="job.status !== 'job-complete' && job.status !== 'error' && job.status !== 'cancelled'" class="link-button" type="button" (click)="cancelJob(job.jobId)">Cancel</button>
+          <div class="job-actions">
+            <button *ngIf="canPauseJob(job)" class="link-button" type="button" (click)="pauseJob(job.jobId)">Pause</button>
+            <button *ngIf="canResumeJob(job)" class="link-button" type="button" (click)="resumeJob(job.jobId)">Resume</button>
+            <button *ngIf="canCancelJob(job)" class="link-button" type="button" (click)="cancelJob(job.jobId)">Cancel</button>
+          </div>
         </div>
       </div>
 
@@ -144,12 +140,13 @@
               <th>Size</th>
               <th>Created</th>
               <th>Local</th>
-              <th>Progress</th>
+              <th>Download</th>
+              <th>Show</th>
             </tr>
           </thead>
           <tbody>
             <tr *ngIf="loadingFiles">
-              <td colspan="6" class="loading-cell">Loading files</td>
+              <td colspan="7" class="loading-cell">Loading files</td>
             </tr>
             <tr *ngFor="let file of files; trackBy: trackFile">
               <td class="select-col">
@@ -157,21 +154,22 @@
               </td>
               <td class="file-name">
                 <strong>{{ file.download_alias }}</strong>
-                <span>{{ file.nda_file_type }}</span>
-                <em *ngIf="file.errorMessage">{{ file.errorMessage }}</em>
               </td>
               <td>{{ formatBytes(file.file_size) }}</td>
-              <td>{{ formatDate(file.created_date) }}</td>
+              <td>{{ formatDateOnly(file.created_date) }}</td>
               <td>
-                <span class="status-pill" [class.ok]="localStatusLabel(file) === 'Downloaded'" [class.warn]="localStatusLabel(file) === 'Partial'" [class.error]="localStatusLabel(file) === 'Failed'">
+                <span class="status-pill" [class.ok]="localStatusLabel(file) === 'Downloaded'" [class.warn]="localStatusLabel(file) === 'Partial' || localStatusLabel(file) === 'Paused'" [class.error]="localStatusLabel(file) === 'Failed'">
                   {{ localStatusLabel(file) }}
                 </span>
               </td>
               <td>
-                <div class="progress-track" [attr.aria-label]="progressPercent(file) + '% complete'">
-                  <span [style.width.%]="progressPercent(file)"></span>
+                <div class="download-indicator" [attr.aria-label]="downloadIndicatorLabel(file)">
+                  <span *ngIf="isFileDownloadActive(file)" class="download-spinner" aria-hidden="true"></span>
+                  <span *ngIf="isFileDownloadComplete(file)" class="download-check" aria-hidden="true">✓</span>
                 </div>
-                <small>{{ progressPercent(file) }}%</small>
+              </td>
+              <td class="show-cell">
+                <button *ngIf="canShowFile(file)" class="link-button" type="button" [disabled]="scanning" (click)="showFileInFolder(file)">Show</button>
               </td>
             </tr>
           </tbody>

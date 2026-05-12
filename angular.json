@@ -25,7 +25,13 @@
               "zone.js"
             ],
             "tsConfig": "tsconfig.app.json",
-            "assets": [],
+              "assets": [
+                {
+                  "glob": "ndaicon.ico",
+                  "input": ".",
+                  "output": "."
+                }
+              ],
             "styles": [
               "src/styles.css"
             ]
