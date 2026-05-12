@@ -1,0 +1,216 @@
+<header class="topbar">
+  <div class="brand">
+    <h1>NDA Download Manager</h1>
+    <span class="runtime" [class.desktop]="isDesktop">{{ isDesktop ? 'Desktop' : 'Web preview' }}</span>
+  </div>
+
+  <div class="top-actions">
+    <button class="secondary" type="button" (click)="openHelp()">Help</button>
+    <button *ngIf="authState.authenticated" class="secondary" type="button" (click)="signOut()">Sign out</button>
+  </div>
+</header>
+
+<main class="loading-screen" *ngIf="(loadingAuth && !authState.authenticated) || (authState.authenticated && initialPackageLoad)">
+  <section class="loading-panel" aria-live="polite">
+    <span class="eyebrow">{{ authState.authenticated ? 'Signed in' : 'RAS authentication' }}</span>
+    <h2>{{ authState.authenticated ? 'Fetching packages, this could take a few minutes' : 'Completing sign-in' }}</h2>
+    <p>{{ authState.authenticated ? 'Loading your NDA packages and files.' : 'Finishing RAS authentication.' }}</p>
+  </section>
+
+  <div class="message error" *ngIf="errorMessage">{{ errorMessage }}</div>
+  <div class="message info" *ngIf="infoMessage">{{ infoMessage }}</div>
+</main>
+
+<main class="sign-in-screen" *ngIf="!authState.authenticated && !loadingAuth">
+  <section class="sign-in-panel" aria-labelledby="sign-in-title">
+    <span class="eyebrow">NDA Download Manager</span>
+    <h2 id="sign-in-title">Sign in</h2>
+    <button class="primary" type="button" [disabled]="loadingAuth" (click)="startSignIn()">
+      {{ loadingAuth ? 'Signing in' : 'Sign in with RAS' }}
+    </button>
+  </section>
+
+  <div class="message error" *ngIf="errorMessage">{{ errorMessage }}</div>
+  <div class="message info" *ngIf="infoMessage">{{ infoMessage }}</div>
+</main>
+
+<main class="workspace" *ngIf="authState.authenticated && !initialPackageLoad">
+  <section class="session-band signed-in">
+    <div>
+      <span class="eyebrow">Signed in</span>
+      <strong>{{ authState.username }}</strong>
+      <span *ngIf="authState.lastVerifiedAt">Verified {{ formatDate(authState.lastVerifiedAt) }}</span>
+    </div>
+
+  </section>
+
+  <div class="message error" *ngIf="errorMessage">{{ errorMessage }}</div>
+  <div class="message info" *ngIf="infoMessage">{{ infoMessage }}</div>
+
+  <section class="content-grid">
+    <aside class="package-pane">
+      <div class="tabs" role="tablist">
+        <button type="button" [class.active]="activeTab === 'mine'" (click)="activeTab = 'mine'">My Packages</button>
+        <button type="button" [class.active]="activeTab === 'shared'" (click)="activeTab = 'shared'">Shared Packages</button>
+      </div>
+
+      <div class="pane-toolbar">
+        <strong>{{ activeTab === 'mine' ? myPackages.length : sharedPackages.length }} packages</strong>
+        <span *ngIf="loadingPackages">Loading</span>
+      </div>
+
+      <div class="package-list" *ngIf="activeTab === 'mine'">
+        <div class="empty-state" *ngIf="!loadingPackages && myPackages.length === 0">
+          No packages.
+        </div>
+
+        <button
+          class="package-row"
+          type="button"
+          *ngFor="let pkg of myPackages; trackBy: trackPackage"
+          [class.selected]="selectedPackage?.id === pkg.id"
+          (click)="selectPackage(pkg)"
+        >
+          <span class="package-title">{{ pkg.name }}</span>
+          <span class="package-meta">{{ pkg.fileCount | number }} files</span>
+          <span class="package-meta">{{ formatBytes(pkg.fileSize) }}</span>
+          <span class="package-date">{{ formatDate(pkg.createdDate) }}</span>
+        </button>
+      </div>
+
+      <div class="package-list" *ngIf="activeTab === 'shared'">
+        <div class="empty-state" *ngIf="!loadingPackages && sharedPackages.length === 0">
+          No shared packages.
+        </div>
+
+        <div class="package-row shared" *ngFor="let pkg of sharedPackages; trackBy: trackPackage">
+          <span class="package-title">{{ pkg.name }}</span>
+          <span class="package-meta">{{ pkg.fileCount | number }} files</span>
+          <span class="package-meta">{{ formatBytes(pkg.fileSize) }}</span>
+          <p>{{ pkg.description }}</p>
+          <button
+            class="secondary"
+            type="button"
+            [disabled]="associatingPackageId === pkg.id"
+            (click)="associatePackage(pkg)"
+          >
+            {{ associatingPackageId === pkg.id ? 'Adding' : 'Add to My Packages' }}
+          </button>
+        </div>
+      </div>
+    </aside>
+
+    <section class="file-pane">
+      <div class="file-header">
+        <div>
+          <h2>{{ selectedPackage ? 'Package files in ' + selectedPackage.name : 'Package files' }}</h2>
+        </div>
+
+        <div class="file-actions">
+          <button class="secondary" type="button" (click)="chooseDownloadDirectory()">Directory</button>
+          <button class="secondary" type="button" [disabled]="!downloadDirectory || scanning" (click)="scanDownloads()">Scan</button>
+          <button class="primary" type="button" [disabled]="startingDownload || files.length === 0" (click)="downloadPackage()">Download Package</button>
+          <button class="primary subtle" type="button" [disabled]="startingDownload || selectedFileCount === 0" (click)="downloadSelected()">Download Selected</button>
+        </div>
+      </div>
+
+      <div class="directory-row">
+        <span>Directory</span>
+        <strong>{{ downloadDirectory || 'Not selected' }}</strong>
+        <span>{{ selectedFileCount }} selected, {{ formatBytes(selectedFilesSize) }}</span>
+      </div>
+
+      <div class="jobs" *ngIf="jobRows.length > 0">
+        <div class="job-row" *ngFor="let job of jobRows">
+          <span>{{ job.packageName }}</span>
+          <strong>{{ job.status }}</strong>
+          <span>{{ job.message || job.downloadAlias || '' }}</span>
+          <button *ngIf="job.status !== 'job-complete' && job.status !== 'error' && job.status !== 'cancelled'" class="link-button" type="button" (click)="cancelJob(job.jobId)">Cancel</button>
+        </div>
+      </div>
+
+      <div class="empty-state" *ngIf="!selectedPackage">
+        {{ myPackages.length === 0 ? 'No packages to download.' : 'Select a package from My Packages.' }}
+      </div>
+
+      <div class="file-table-wrap" *ngIf="selectedPackage">
+        <table class="file-table">
+          <thead>
+            <tr>
+              <th class="select-col">
+                <input type="checkbox" [checked]="allFilesSelected" (change)="toggleAllFiles()" aria-label="Select all files">
+              </th>
+              <th>File</th>
+              <th>Size</th>
+              <th>Created</th>
+              <th>Local</th>
+              <th>Progress</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr *ngIf="loadingFiles">
+              <td colspan="6" class="loading-cell">Loading files</td>
+            </tr>
+            <tr *ngFor="let file of files; trackBy: trackFile">
+              <td class="select-col">
+                <input type="checkbox" [checked]="file.selected" (change)="toggleFile(file)" [attr.aria-label]="'Select ' + file.download_alias">
+              </td>
+              <td class="file-name">
+                <strong>{{ file.download_alias }}</strong>
+                <span>{{ file.nda_file_type }}</span>
+                <em *ngIf="file.errorMessage">{{ file.errorMessage }}</em>
+              </td>
+              <td>{{ formatBytes(file.file_size) }}</td>
+              <td>{{ formatDate(file.created_date) }}</td>
+              <td>
+                <span class="status-pill" [class.ok]="localStatusLabel(file) === 'Downloaded'" [class.warn]="localStatusLabel(file) === 'Partial'" [class.error]="localStatusLabel(file) === 'Failed'">
+                  {{ localStatusLabel(file) }}
+                </span>
+              </td>
+              <td>
+                <div class="progress-track" [attr.aria-label]="progressPercent(file) + '% complete'">
+                  <span [style.width.%]="progressPercent(file)"></span>
+                </div>
+                <small>{{ progressPercent(file) }}%</small>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </section>
+</main>
+
+<div class="modal-backdrop" *ngIf="showHelp">
+  <section class="modal" role="dialog" aria-modal="true" aria-labelledby="help-title">
+    <header>
+      <h2 id="help-title">Help Request</h2>
+      <button class="icon-button" type="button" aria-label="Close" (click)="closeHelp()">x</button>
+    </header>
+
+    <label class="field">
+      <span>Full name</span>
+      <input [(ngModel)]="helpForm.name" autocomplete="name">
+    </label>
+
+    <label class="field">
+      <span>Username</span>
+      <input [(ngModel)]="helpForm.username" autocomplete="username">
+    </label>
+
+    <label class="field">
+      <span>Email</span>
+      <input [(ngModel)]="helpForm.email" type="email" autocomplete="email">
+    </label>
+
+    <label class="field">
+      <span>Description</span>
+      <textarea [(ngModel)]="helpForm.message" rows="6"></textarea>
+    </label>
+
+    <footer>
+      <button class="secondary" type="button" (click)="closeHelp()">Cancel</button>
+      <button class="primary" type="button" [disabled]="sendingHelp" (click)="submitHelp()">{{ sendingHelp ? 'Sending' : 'Send' }}</button>
+    </footer>
+  </section>
+</div>
