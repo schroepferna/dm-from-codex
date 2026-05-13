@@ -105,7 +105,7 @@
           <button class="secondary" type="button" (click)="chooseDownloadDirectory()">Directory</button>
           <button class="secondary" type="button" [disabled]="!downloadDirectory || scanning" (click)="scanDownloads()">Scan</button>
           <button class="secondary" type="button" *ngIf="selectedPackage" [disabled]="!canShowPackageDownload() || scanning" (click)="showPackageInFolder()">Show Package</button>
-          <button class="primary" type="button" [disabled]="downloadInProgress || files.length === 0" (click)="downloadPackage()">Download Package</button>
+          <button class="primary" type="button" [disabled]="downloadInProgress || downloadableFileCount === 0" (click)="downloadPackage()">Download Package</button>
           <button class="primary subtle" type="button" [disabled]="downloadInProgress || selectedFileCount === 0" (click)="downloadSelected()">Download Selected</button>
         </div>
       </div>
@@ -138,7 +138,7 @@
           <thead>
             <tr>
               <th class="select-col">
-                <input type="checkbox" [checked]="allFilesSelected" (change)="toggleAllFiles()" aria-label="Select all files">
+                <input type="checkbox" [checked]="allFilesSelected" [disabled]="downloadableFileCount === 0" (change)="toggleAllFiles()" aria-label="Select all files">
               </th>
               <th>File</th>
               <th>Size</th>
@@ -154,7 +154,7 @@
             </tr>
             <tr *ngFor="let file of files; trackBy: trackFile">
               <td class="select-col">
-                <input type="checkbox" [checked]="file.selected" (change)="toggleFile(file)" [attr.aria-label]="'Select ' + file.download_alias">
+                <input type="checkbox" [checked]="file.selected" [disabled]="!canSelectFileForDownload(file)" (change)="toggleFile(file)" [attr.aria-label]="'Select ' + file.download_alias">
               </td>
               <td class="file-name">
                 <strong>{{ file.download_alias }}</strong>

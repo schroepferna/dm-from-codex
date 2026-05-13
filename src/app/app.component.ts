@@ -131,16 +131,21 @@ export class AppComponent implements OnInit, OnDestroy {
   }
 
   get selectedFileCount(): number {
-    return this.files.filter((file) => file.selected).length;
+    return this.files.filter((file) => file.selected && this.canSelectFileForDownload(file)).length;
   }
 
   get allFilesSelected(): boolean {
-    return this.files.length > 0 && this.files.every((file) => file.selected);
+    const selectableFiles = this.files.filter((file) => this.canSelectFileForDownload(file));
+    return selectableFiles.length > 0 && selectableFiles.every((file) => file.selected);
+  }
+
+  get downloadableFileCount(): number {
+    return this.files.filter((file) => this.canSelectFileForDownload(file)).length;
   }
 
   get selectedFilesSize(): number {
     return this.files
-      .filter((file) => file.selected)
+      .filter((file) => file.selected && this.canSelectFileForDownload(file))
       .reduce((total, file) => total + file.file_size, 0);
   }
 
@@ -440,6 +445,7 @@ export class AppComponent implements OnInit, OnDestroy {
         const downloaded = result.exists && result.complete;
         return {
           ...file,
+          selected: downloaded ? false : file.selected,
           localStatus: result.exists ? (result.complete ? 'downloaded' : 'partial') : 'missing',
           localSize: result.size,
           localModifiedAt: result.modifiedAt,
@@ -459,23 +465,34 @@ export class AppComponent implements OnInit, OnDestroy {
 
   toggleAllFiles(): void {
     const selected = !this.allFilesSelected;
-    this.files = this.files.map((file) => ({ ...file, selected }));
+    this.files = this.files.map((file) => this.canSelectFileForDownload(file)
+      ? { ...file, selected }
+      : { ...file, selected: false });
   }
 
   toggleFile(file: UiFile): void {
+    if (!this.canSelectFileForDownload(file)) {
+      file.selected = false;
+      return;
+    }
+
     file.selected = !file.selected;
   }
 
   async downloadSelected(): Promise<void> {
-    await this.startDownload(this.files.filter((file) => file.selected));
+    await this.startDownload(this.files.filter((file) => file.selected && this.canSelectFileForDownload(file)));
   }
 
   async downloadPackage(): Promise<void> {
-    await this.startDownload(this.files);
+    await this.startDownload(this.files.filter((file) => this.canSelectFileForDownload(file)));
   }
 
   canShowFile(file: UiFile): boolean {
     return file.localStatus === 'downloaded' && Boolean(file.localPath);
+  }
+
+  canSelectFileForDownload(file: UiFile): boolean {
+    return !this.isFileDownloadComplete(file);
   }
 
   canShowPackageDownload(): boolean {
@@ -722,6 +739,7 @@ export class AppComponent implements OnInit, OnDestroy {
 
   private async startDownload(files: UiFile[]): Promise<void> {
     this.clearMessages();
+    const filesToDownload = files.filter((file) => this.canSelectFileForDownload(file));
 
     if (!this.selectedPackage || !this.authState.token) {
       this.errorMessage = 'Select a package and sign in first.';
@@ -733,8 +751,8 @@ export class AppComponent implements OnInit, OnDestroy {
       return;
     }
 
-    if (files.length === 0) {
-      this.errorMessage = 'Select at least one file.';
+    if (filesToDownload.length === 0) {
+      this.errorMessage = 'Select at least one file that has not been downloaded.';
       return;
     }
 
@@ -745,7 +763,7 @@ export class AppComponent implements OnInit, OnDestroy {
 
     let nativeFiles: NativeFileInput[];
     try {
-      nativeFiles = files.map((file) => toNativeFile(file));
+      nativeFiles = filesToDownload.map((file) => toNativeFile(file));
       validatePackageId(this.selectedPackage.id, this.selectedPackage.name);
     } catch (error) {
       this.errorMessage = errorMessage(error);
@@ -754,8 +772,8 @@ export class AppComponent implements OnInit, OnDestroy {
 
     this.clearPreviousDownloadErrors();
     this.startingDownload = true;
-    this.infoMessage = `Preparing ${files.length} file${files.length === 1 ? '' : 's'} for download.`;
-    this.files = this.files.map((file) => files.some((selected) => selected.package_file_id === file.package_file_id)
+    this.infoMessage = `Preparing ${filesToDownload.length} file${filesToDownload.length === 1 ? '' : 's'} for download.`;
+    this.files = this.files.map((file) => filesToDownload.some((selected) => selected.package_file_id === file.package_file_id)
       ? {
           ...file,
           downloadStatus: 'queued',
@@ -766,7 +784,7 @@ export class AppComponent implements OnInit, OnDestroy {
       : file);
 
     try {
-      const startMessage = formatDownloadStartMessage(files, this.selectedPackage.id);
+      const startMessage = formatDownloadStartMessage(filesToDownload, this.selectedPackage.id);
       this.infoMessage = startMessage;
       const result = await withTimeout(this.downloads.start({
         host: this.authState.host,
@@ -880,6 +898,7 @@ export class AppComponent implements OnInit, OnDestroy {
           localStatus: completed ? 'downloaded' : file.localStatus,
           localSize: completed ? totalBytes : file.localSize,
           localPath: completed ? (event.path ?? file.localPath) : file.localPath,
+          selected: completed ? false : file.selected,
           errorMessage: event.status === 'error' ? event.message || 'Download failed.' : file.errorMessage
         };
       });
@@ -912,6 +931,7 @@ export class AppComponent implements OnInit, OnDestroy {
             localStatus: 'downloaded',
             localSize: totalBytes,
             localPath: file.localPath,
+            selected: false,
             errorMessage: null
           };
         });
