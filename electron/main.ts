@@ -112,6 +112,7 @@ interface HelpRequest {
   username: string;
   email: string;
   message: string;
+  zendeskToken?: string;
 }
 
 let mainWindow: BrowserWindow | null = null;
@@ -1349,8 +1350,12 @@ function sendDownloadEvent(job: DownloadJob, event: Omit<DownloadEvent, 'jobId' 
 }
 
 async function submitHelpRequest(request: HelpRequest): Promise<{ ok: boolean; status: number; message: string }> {
-  if (!ZENDESK_TOKEN || ZENDESK_TOKEN === 'REPLACE_WITH_ZENDESK_TOKEN') {
-    throw new Error('NDA_DM_ZENDESK_TOKEN is not configured.');
+  const zendeskToken = typeof request.zendeskToken === 'string' && request.zendeskToken.trim()
+    ? request.zendeskToken.trim()
+    : ZENDESK_TOKEN;
+
+  if (!zendeskToken || zendeskToken === 'REPLACE_WITH_ZENDESK_TOKEN') {
+    throw new Error('Zendesk token is not configured.');
   }
 
   const payload = {
@@ -1374,7 +1379,7 @@ async function submitHelpRequest(request: HelpRequest): Promise<{ ok: boolean; s
   const response = await fetch('https://ndar.zendesk.com/hc/requests', {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${ZENDESK_TOKEN}`,
+      Authorization: `Bearer ${zendeskToken}`,
       'Content-Type': 'application/json'
     },
     body: JSON.stringify(payload)

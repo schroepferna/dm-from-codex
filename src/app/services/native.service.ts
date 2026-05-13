@@ -12,6 +12,7 @@ import {
   DownloadStartResult,
   HelpRequest,
   HelpResponse,
+  NdaDesktopBridge,
   ScanDownloadRequest,
   ScanDownloadResult,
   ShowPackageRequest
@@ -19,133 +20,72 @@ import {
 
 @Injectable({ providedIn: 'root' })
 export class NativeService {
+  private get desktopBridge(): NdaDesktopBridge {
+    if (!window.ndaDm) {
+      throw new Error('The NDA Download Manager must be run in the Electron desktop app.');
+    }
+
+    return window.ndaDm;
+  }
+
   get isDesktop(): boolean {
     return Boolean(window.ndaDm);
   }
 
   openAuthUrl(url: string): Promise<void> {
-    if (window.ndaDm) {
-      return window.ndaDm.openAuthUrl(url);
-    }
-
-    window.open(url, '_blank', 'noopener,noreferrer');
-    return Promise.resolve();
+    return this.desktopBridge.openAuthUrl(url);
   }
 
   completeSignIn(request: AuthCompleteRequest): Promise<AuthCompleteResponse> {
-    if (!window.ndaDm) {
-      return Promise.reject(new Error('RAS sign-in requires the desktop app.'));
-    }
-
-    return window.ndaDm.completeSignIn(request);
+    return this.desktopBridge.completeSignIn(request);
   }
 
   verifySession(request: AuthVerifySessionRequest): Promise<AuthVerifySessionResponse> {
-    if (!window.ndaDm) {
-      return Promise.reject(new Error('Session verification requires the desktop app.'));
-    }
-
-    return window.ndaDm.verifySession(request);
+    return this.desktopBridge.verifySession(request);
   }
 
   getDefaultDownloadDirectory(): Promise<string> {
-    if (window.ndaDm) {
-      return window.ndaDm.getDefaultDownloadDirectory();
-    }
-
-    return Promise.resolve('');
+    return this.desktopBridge.getDefaultDownloadDirectory();
   }
 
   getAvailableSpace(targetDir: string): Promise<AvailableSpaceResult> {
-    if (window.ndaDm) {
-      return window.ndaDm.getAvailableSpace(targetDir);
-    }
-
-    return Promise.resolve({
-      availableBytes: Number.MAX_SAFE_INTEGER,
-      path: targetDir
-    });
+    return this.desktopBridge.getAvailableSpace(targetDir);
   }
 
   chooseDownloadDirectory(): Promise<string | null> {
-    if (window.ndaDm) {
-      return window.ndaDm.chooseDownloadDirectory();
-    }
-
-    const value = window.prompt('Download directory');
-    return Promise.resolve(value?.trim() || null);
+    return this.desktopBridge.chooseDownloadDirectory();
   }
 
   scanDownloadDirectory(request: ScanDownloadRequest): Promise<ScanDownloadResult[]> {
-    if (!window.ndaDm) {
-      return Promise.resolve(request.files.map((file) => ({
-        packageFileId: file.packageFileId,
-        downloadAlias: file.downloadAlias,
-        exists: false,
-        complete: false,
-        size: null,
-        modifiedAt: null,
-        path: null
-      })));
-    }
-
-    return window.ndaDm.scanDownloadDirectory(request);
+    return this.desktopBridge.scanDownloadDirectory(request);
   }
 
   showItemInFolder(path: string): Promise<void> {
-    if (!window.ndaDm) {
-      return Promise.reject(new Error('Showing files requires the desktop app.'));
-    }
-
-    return window.ndaDm.showItemInFolder(path);
+    return this.desktopBridge.showItemInFolder(path);
   }
 
   showPackageInFolder(request: ShowPackageRequest): Promise<void> {
-    if (!window.ndaDm) {
-      return Promise.reject(new Error('Showing packages requires the desktop app.'));
-    }
-
-    return window.ndaDm.showPackageInFolder(request);
+    return this.desktopBridge.showPackageInFolder(request);
   }
 
   startDownloadJob(request: DownloadStartRequest): Promise<DownloadStartResult> {
-    if (!window.ndaDm) {
-      return Promise.reject(new Error('Downloads require the desktop app.'));
-    }
-
-    return window.ndaDm.startDownloadJob(request);
+    return this.desktopBridge.startDownloadJob(request);
   }
 
   pauseDownloadJob(jobId: string): Promise<void> {
-    if (!window.ndaDm) {
-      return Promise.resolve();
-    }
-
-    return window.ndaDm.pauseDownloadJob(jobId);
+    return this.desktopBridge.pauseDownloadJob(jobId);
   }
 
   resumeDownloadJob(jobId: string): Promise<void> {
-    if (!window.ndaDm) {
-      return Promise.resolve();
-    }
-
-    return window.ndaDm.resumeDownloadJob(jobId);
+    return this.desktopBridge.resumeDownloadJob(jobId);
   }
 
   cancelDownloadJob(jobId: string): Promise<void> {
-    if (!window.ndaDm) {
-      return Promise.resolve();
-    }
-
-    return window.ndaDm.cancelDownloadJob(jobId);
+    return this.desktopBridge.cancelDownloadJob(jobId);
   }
 
   sendHelpRequest(request: HelpRequest): Promise<HelpResponse> {
-    if (!window.ndaDm) {
-      return Promise.reject(new Error('Help requests require the desktop app.'));
-    }
-
-    return window.ndaDm.sendHelpRequest(request);
+    return this.desktopBridge.sendHelpRequest(request);
   }
 
   authCallbacks(): Observable<AuthCallbackPayload> {

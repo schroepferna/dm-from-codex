@@ -1,4 +1,5 @@
 import { Injectable } from '@angular/core';
+import { environment } from '../../environments/environment';
 import { HelpRequest, HelpResponse } from '../models/native-api.models';
 import { NativeService } from './native.service';
 
@@ -7,6 +8,9 @@ export class HelpService {
   constructor(private readonly native: NativeService) {}
 
   submit(request: HelpRequest): Promise<HelpResponse> {
-    return this.native.sendHelpRequest(request);
+    return this.native.sendHelpRequest({
+      ...request,
+      zendeskToken: environment.zendeskToken
+    });
   }
 }

@@ -11,9 +11,6 @@
     "start": "npm run build:electron && concurrently --kill-others-on-fail \"ng serve --host 127.0.0.1 --port 4200\" \"wait-on http://127.0.0.1:4200 && electron .\"",
     "start:stage": "npm run build:electron && concurrently --kill-others-on-fail \"ng serve --host 127.0.0.1 --port 4200 --configuration stage\" \"wait-on http://127.0.0.1:4200 && electron .\"",
     "start:revengers": "npm run build:electron && concurrently --kill-others-on-fail \"ng serve --host 127.0.0.1 --port 4200 --configuration revengers\" \"wait-on http://127.0.0.1:4200 && electron .\"",
-    "start:web": "ng serve --host 127.0.0.1 --port 4200",
-    "start:web:stage": "ng serve --host 127.0.0.1 --port 4200 --configuration stage",
-    "start:web:revengers": "ng serve --host 127.0.0.1 --port 4200 --configuration revengers",
     "electron": "npm run build:electron && electron .",
     "package": "npm run build && electron-builder",
     "lint": "ng lint"

@@ -94,6 +94,7 @@ export interface HelpRequest {
   username: string;
   email: string;
   message: string;
+  zendeskToken?: string;
 }
 
 export interface HelpResponse {
