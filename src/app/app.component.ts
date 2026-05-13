@@ -63,7 +63,14 @@ export class AppComponent implements OnInit, OnDestroy {
   private readonly jobFileIds = new Map<string, Set<number>>();
   private readonly pausedJobIds = new Set<string>();
   private completingSessionId: string | null = null;
-  private readonly clearAuthCacheOnExit = () => this.auth.clearAuthCache();
+  private readonly handleBeforeUnload = () => {
+    this.clearTransientErrors();
+    this.auth.clearAuthCache();
+  };
+  private readonly handlePageShow = () => {
+    this.clearTransientErrors();
+    this.changeDetector.detectChanges();
+  };
 
   constructor(
     private readonly auth: AuthService,
@@ -79,7 +86,9 @@ export class AppComponent implements OnInit, OnDestroy {
   }
 
   ngOnInit(): void {
-    window.addEventListener('beforeunload', this.clearAuthCacheOnExit);
+    this.clearTransientErrors();
+    window.addEventListener('beforeunload', this.handleBeforeUnload);
+    window.addEventListener('pageshow', this.handlePageShow);
     void this.setDefaultDownloadDirectory();
 
     this.auth.state$
@@ -113,7 +122,8 @@ export class AppComponent implements OnInit, OnDestroy {
   }
 
   ngOnDestroy(): void {
-    window.removeEventListener('beforeunload', this.clearAuthCacheOnExit);
+    window.removeEventListener('beforeunload', this.handleBeforeUnload);
+    window.removeEventListener('pageshow', this.handlePageShow);
     this.auth.clearAuthCache();
     this.packages.clearFileCache();
     this.destroyed$.next();
@@ -243,11 +253,12 @@ export class AppComponent implements OnInit, OnDestroy {
 
       this.myPackages = myPackages.map((item) => normalizeMyPackage(item));
       this.sharedPackages = sharedPackages.map((item) => normalizeSharedPackage(item));
-      await this.preloadPackageFiles(state);
 
       if (!this.selectedPackage && this.myPackages.length > 0) {
         void this.selectPackage(this.myPackages[0]);
       }
+
+      this.preloadPackageFilesInBackground(state, this.selectedPackage?.id);
     } catch (error) {
       this.errorMessage = errorMessage(error);
     } finally {
@@ -278,16 +289,12 @@ export class AppComponent implements OnInit, OnDestroy {
     try {
       const myPackages = await this.packages.getMyPackages(state.host, state.token);
       this.myPackages = myPackages.map((item) => normalizeMyPackage(item));
-      try {
-        await this.preloadPackageFiles(state);
-      } catch (error) {
-        this.errorMessage = errorMessage(error);
-      }
 
       if (!this.selectedPackage && this.myPackages.length > 0) {
         void this.selectPackage(this.myPackages[0]);
       }
 
+      this.preloadPackageFilesInBackground(state, this.selectedPackage?.id);
       this.changeDetector.detectChanges();
     } catch (error) {
       this.errorMessage = errorMessage(error);
@@ -297,16 +304,27 @@ export class AppComponent implements OnInit, OnDestroy {
     }
   }
 
-  private preloadPackageFiles(state: AuthState): Promise<void> {
+  private preloadPackageFiles(state: AuthState, excludePackageId?: number): Promise<void> {
     if (!state.token || this.myPackages.length === 0) {
       return Promise.resolve();
     }
 
+    const packageIds = this.myPackages
+      .map((pkg) => pkg.id)
+      .filter((packageId) => packageId !== excludePackageId);
+
     return this.packages.preloadFilesForPackages(
       state.host,
       state.token,
-      this.myPackages.map((pkg) => pkg.id)
+      packageIds,
+      6
     );
+  }
+
+  private preloadPackageFilesInBackground(state: AuthState, excludePackageId?: number): void {
+    void this.preloadPackageFiles(state, excludePackageId).catch((error) => {
+      console.warn('Background package file preload failed.', error);
+    });
   }
 
   async selectPackage(pkg: UiPackage): Promise<void> {
@@ -354,18 +372,24 @@ export class AppComponent implements OnInit, OnDestroy {
     }
 
     this.associatingPackageId = pkg.id;
+    this.infoMessage = `Adding ${pkg.name} to my packages...`;
+    this.changeDetector.detectChanges();
 
     try {
       const associated = await this.packages.associateSharedPackage(this.authState.host, this.authState.token, pkg.id);
       const normalized = normalizeMyPackage(associated);
       this.myPackages = [normalized, ...this.myPackages.filter((item) => item.id !== normalized.id)];
+      this.sharedPackages = this.sharedPackages.filter((item) => item.id !== normalized.id);
       this.activeTab = 'mine';
+      this.changeDetector.detectChanges();
       await this.selectPackage(normalized);
       this.infoMessage = 'Package added to My Packages.';
+      this.changeDetector.detectChanges();
     } catch (error) {
       this.errorMessage = errorMessage(error);
     } finally {
       this.associatingPackageId = null;
+      this.changeDetector.detectChanges();
     }
   }
 
@@ -728,6 +752,7 @@ export class AppComponent implements OnInit, OnDestroy {
       return;
     }
 
+    this.clearPreviousDownloadErrors();
     this.startingDownload = true;
     this.infoMessage = `Preparing ${files.length} file${files.length === 1 ? '' : 's'} for download.`;
     this.files = this.files.map((file) => files.some((selected) => selected.package_file_id === file.package_file_id)
@@ -752,6 +777,7 @@ export class AppComponent implements OnInit, OnDestroy {
         targetDir: this.downloadDirectory,
         files: nativeFiles,
         fileConcurrency: 2,
+        tokenConcurrency: 8,
         chunkConcurrency: 4
       }), 15000, 'Starting the download job timed out before Electron acknowledged it.');
 
@@ -770,6 +796,38 @@ export class AppComponent implements OnInit, OnDestroy {
     } finally {
       this.startingDownload = false;
     }
+  }
+
+  private clearPreviousDownloadErrors(): void {
+    let removedJobError = false;
+
+    for (const [jobId, event] of this.latestJobEvents) {
+      if (event.status === 'error') {
+        this.latestJobEvents.delete(jobId);
+        this.jobFileIds.delete(jobId);
+        this.pausedJobIds.delete(jobId);
+        removedJobError = true;
+      }
+    }
+
+    if (removedJobError) {
+      this.syncJobRows();
+    }
+
+    this.files = this.files.map((file) => file.downloadStatus === 'error'
+      ? {
+          ...file,
+          downloadStatus: null,
+          receivedBytes: 0,
+          totalBytes: file.file_size,
+          errorMessage: null
+        }
+      : file);
+  }
+
+  private clearTransientErrors(): void {
+    this.errorMessage = null;
+    this.clearPreviousDownloadErrors();
   }
 
   private async setDefaultDownloadDirectory(): Promise<void> {
@@ -967,13 +1025,51 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string)
 }
 
 function errorMessage(error: unknown): string {
-  if (error instanceof Error) {
+  if (error instanceof Error && error.message) {
     return error.message;
   }
 
-  if (typeof error === 'string') {
-    return error;
+  if (typeof error === 'string' && error.trim()) {
+    return error.trim();
+  }
+
+  if (error && typeof error === 'object') {
+    const record = error as Record<string, unknown>;
+    const directMessage = stringValue(record['message']);
+    const nestedMessage = stringValue(record['error'])
+      || stringValue((record['error'] as Record<string, unknown> | null)?.['message'])
+      || stringValue((record['error'] as Record<string, unknown> | null)?.['errorMessage']);
+
+    if (directMessage && nestedMessage && directMessage !== nestedMessage) {
+      return `${directMessage}: ${nestedMessage}`;
+    }
+
+    if (directMessage) {
+      return directMessage;
+    }
+
+    if (nestedMessage) {
+      return nestedMessage;
+    }
+
+    const status = stringValue(record['status']);
+    const statusText = stringValue(record['statusText']);
+    if (status) {
+      return `Request failed with HTTP ${status}${statusText ? ` ${statusText}` : ''}.`;
+    }
   }
 
   return 'An unexpected error occurred.';
+}
+
+function stringValue(value: unknown): string | null {
+  if (typeof value === 'string' && value.trim()) {
+    return value.trim();
+  }
+
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return String(value);
+  }
+
+  return null;
 }

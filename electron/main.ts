@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, shell, WebContents } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, net, shell, WebContents } from 'electron';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import { mkdir, open, rename, rm, stat, statfs } from 'node:fs/promises';
@@ -11,6 +11,7 @@ import { GetObjectCommand, HeadObjectCommand, S3Client } from '@aws-sdk/client-s
 const PROTOCOL = 'nda-dm';
 const DEFAULT_AWS_REGION = process.env['NDA_DM_AWS_REGION'] || 'us-east-1';
 const DEFAULT_FILE_CONCURRENCY = 2;
+const DEFAULT_TOKEN_CONCURRENCY = 8;
 const DEFAULT_CHUNK_CONCURRENCY = 4;
 const CHUNK_SIZE_BYTES = 64 * 1024 * 1024;
 const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
@@ -56,6 +57,7 @@ interface DownloadStartRequest {
   targetDir: string;
   files: NativeFileInput[];
   fileConcurrency?: number;
+  tokenConcurrency?: number;
   chunkConcurrency?: number;
 }
 
@@ -93,6 +95,16 @@ interface DownloadJob {
   paused: boolean;
   pauseWaiters: Array<() => void>;
   activeFiles: Map<number, NativeFileInput>;
+  downloadTokens: Map<number, Promise<DownloadTokenResult>>;
+}
+
+type DownloadTokenResult =
+  | { ok: true; token: DownloadTokenResponse }
+  | { ok: false; error: unknown };
+
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
 }
 
 interface HelpRequest {
@@ -481,7 +493,8 @@ function registerIpcHandlers(): void {
       heartbeatTimer: null,
       paused: false,
       pauseWaiters: [],
-      activeFiles: new Map()
+      activeFiles: new Map(),
+      downloadTokens: new Map()
     };
 
     jobs.set(job.id, job);
@@ -692,7 +705,11 @@ async function scanDownloadDirectory(request: ScanDownloadRequest): Promise<unkn
 }
 
 async function runDownloadJob(job: DownloadJob): Promise<void> {
-  const { files, fileConcurrency = DEFAULT_FILE_CONCURRENCY } = job.request;
+  const {
+    files,
+    fileConcurrency = DEFAULT_FILE_CONCURRENCY,
+    tokenConcurrency = DEFAULT_TOKEN_CONCURRENCY
+  } = job.request;
 
   try {
     for (const file of files) {
@@ -710,10 +727,22 @@ async function runDownloadJob(job: DownloadJob): Promise<void> {
 
     const packageTargetDir = resolvePackageTargetDir(job.request.targetDir, job.request.packageId);
     await mkdir(packageTargetDir, { recursive: true });
-    sendDownloadEvent(job, { status: 'fetching-token', message: 'Preparing downloads.' });
-    startDownloadHeartbeat(job);
+    sendDownloadEvent(job, { status: 'queued', message: 'Checking existing files.' });
+    const filesToDownload = await prepareDownloadFiles(job, files);
 
-    await runLimited(files, clamp(fileConcurrency, 1, 6), async (file) => {
+    if (filesToDownload.length === 0) {
+      sendDownloadEvent(job, { status: 'job-complete', message: 'Download complete.' });
+      return;
+    }
+
+    sendDownloadEvent(job, {
+      status: 'fetching-token',
+      message: `Preparing download tokens for ${filesToDownload.length} file${filesToDownload.length === 1 ? '' : 's'}.`
+    });
+    startDownloadHeartbeat(job);
+    const tokenPrefetch = prefetchDownloadTokens(job, filesToDownload, clamp(tokenConcurrency, 1, 12));
+
+    await runLimited(filesToDownload, clamp(fileConcurrency, 1, 6), async (file) => {
       await waitForResume(job);
 
       if (job.abortController.signal.aborted) {
@@ -722,21 +751,105 @@ async function runDownloadJob(job: DownloadJob): Promise<void> {
 
       await downloadOneFile(job, file);
     });
+    await tokenPrefetch;
 
     sendDownloadEvent(job, { status: 'job-complete', message: 'Download complete.' });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Download failed.';
-    sendDownloadEvent(job, { status: job.abortController.signal.aborted ? 'cancelled' : 'error', message });
+    const wasCancelled = job.abortController.signal.aborted;
+    if (!wasCancelled) {
+      job.abortController.abort();
+    }
+    sendDownloadEvent(job, { status: wasCancelled ? 'cancelled' : 'error', message });
   } finally {
     job.paused = false;
     releasePauseWaiters(job);
     job.activeFiles.clear();
+    job.downloadTokens.clear();
 
     if (job.heartbeatTimer) {
       clearInterval(job.heartbeatTimer);
       job.heartbeatTimer = null;
     }
   }
+}
+
+async function prepareDownloadFiles(job: DownloadJob, files: NativeFileInput[]): Promise<NativeFileInput[]> {
+  const pendingFileIds = new Set<number>();
+
+  await runLimited(files, 16, async (file) => {
+    const finalPath = resolveInside(resolvePackageTargetDir(job.request.targetDir, job.request.packageId), file.downloadAlias);
+    const existing = await statIfExists(finalPath);
+    if (existing && file.fileSize > 0 && existing.size === file.fileSize) {
+      sendDownloadEvent(job, {
+        packageFileId: file.packageFileId,
+        downloadAlias: file.downloadAlias,
+        status: 'skipped',
+        receivedBytes: existing.size,
+        totalBytes: file.fileSize,
+        path: finalPath,
+        message: 'Already downloaded.'
+      });
+      return;
+    }
+
+    pendingFileIds.add(file.packageFileId);
+  });
+
+  return files.filter((file) => pendingFileIds.has(file.packageFileId));
+}
+
+async function prefetchDownloadTokens(job: DownloadJob, files: NativeFileInput[], concurrency: number): Promise<void> {
+  const deferredByFileId = new Map<number, Deferred<DownloadTokenResult>>();
+
+  for (const file of files) {
+    const deferred = createDeferred<DownloadTokenResult>();
+    deferredByFileId.set(file.packageFileId, deferred);
+    job.downloadTokens.set(file.packageFileId, deferred.promise);
+  }
+
+  await runLimited(files, concurrency, async (file) => {
+    const deferred = deferredByFileId.get(file.packageFileId);
+    if (!deferred) {
+      return;
+    }
+
+    try {
+      await waitForResume(job);
+
+      if (job.abortController.signal.aborted) {
+        throw new Error('Download cancelled.');
+      }
+
+      const token = await fetchDownloadToken(job, file);
+      deferred.resolve({ ok: true, token });
+    } catch (error) {
+      deferred.resolve({ ok: false, error });
+    }
+  });
+}
+
+async function getDownloadToken(job: DownloadJob, file: NativeFileInput): Promise<DownloadTokenResponse> {
+  const prefetched = job.downloadTokens.get(file.packageFileId);
+  if (!prefetched) {
+    return fetchDownloadToken(job, file);
+  }
+
+  const result = await prefetched;
+  if (result.ok) {
+    return result.token;
+  }
+
+  throw result.error instanceof Error ? result.error : new Error('Download token request failed.');
+}
+
+function createDeferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((innerResolve) => {
+    resolve = innerResolve;
+  });
+
+  return { promise, resolve };
 }
 
 async function checkDownloadDiskSpace(job: DownloadJob): Promise<void> {
@@ -870,7 +983,7 @@ async function verifySessionForJob(job: DownloadJob): Promise<void> {
     return;
   }
 
-  const response = await fetch(`${trimTrailingSlash(host)}/api/ras/verifySession`, {
+  const response = await fetchWithTimeout(`${trimTrailingSlash(host)}/api/ras/verifySession`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${authToken}`,
@@ -922,7 +1035,7 @@ async function downloadOneFile(job: DownloadJob, file: NativeFileInput): Promise
       message: ''
     });
 
-    const downloadToken = await fetchDownloadToken(job, file);
+    const downloadToken = await getDownloadToken(job, file);
     await waitForResume(job);
     const s3Location = parseS3Uri(downloadToken.source_uri);
     const client = new S3Client({
@@ -1030,7 +1143,7 @@ async function fetchDownloadToken(job: DownloadJob, file: NativeFileInput): Prom
 
 function requestDownloadToken(job: DownloadJob, file: NativeFileInput): Promise<Response> {
   const url = `${trimTrailingSlash(job.request.host)}/api/package/${job.request.packageId}/files/${file.packageFileId}/download_token`;
-  return fetch(url, {
+  return fetchWithTimeout(url, {
     headers: {
       Authorization: `Bearer ${job.request.authToken}`
     },
@@ -1416,20 +1529,37 @@ function clamp(value: number, min: number, max: number): number {
 
 async function fetchWithTimeout(url: string, init: RequestInit = {}): Promise<Response> {
   const abortController = new AbortController();
-  const timer = setTimeout(() => abortController.abort(), AUTH_REQUEST_TIMEOUT_MS);
+  const upstreamSignal = init.signal;
+  let timedOut = false;
+
+  const abortFromUpstream = () => {
+    abortController.abort(upstreamSignal?.reason);
+  };
+
+  if (upstreamSignal?.aborted) {
+    abortFromUpstream();
+  } else {
+    upstreamSignal?.addEventListener('abort', abortFromUpstream, { once: true });
+  }
+
+  const timer = setTimeout(() => {
+    timedOut = true;
+    abortController.abort();
+  }, AUTH_REQUEST_TIMEOUT_MS);
 
   try {
-    return await fetch(url, {
+    return await net.fetch(url, {
       ...init,
       signal: abortController.signal
     });
   } catch (error) {
-    if (abortController.signal.aborted) {
+    if (timedOut) {
       throw new Error('RAS request timed out.');
     }
 
     throw error;
   } finally {
+    upstreamSignal?.removeEventListener('abort', abortFromUpstream);
     clearTimeout(timer);
   }
 }

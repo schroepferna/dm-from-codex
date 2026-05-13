@@ -30,6 +30,11 @@
                   "glob": "ndaicon.ico",
                   "input": ".",
                   "output": "."
+                },
+                {
+                  "glob": "ndaicon.png",
+                  "input": ".",
+                  "output": "."
                 }
               ],
             "styles": [

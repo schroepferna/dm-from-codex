@@ -1,6 +1,10 @@
 <header class="topbar">
   <div class="brand">
-    <h1>NDA Download Manager</h1>
+    <img class="brand-icon" src="ndaicon.png" alt="" aria-hidden="true">
+    <div class="brand-copy">
+      <span>NIMH Data Archive</span>
+      <h1>Download Manager</h1>
+    </div>
     <span class="runtime" [class.desktop]="isDesktop">{{ isDesktop ? 'Desktop' : 'Web preview' }}</span>
   </div>
 
@@ -22,7 +26,7 @@
 
   <main class="sign-in-screen" *ngIf="!authState.authenticated && !loadingAuth">
     <section class="sign-in-panel" aria-label="Sign in">
-      <img class="sign-in-icon" src="ndaicon.ico" alt="" aria-hidden="true">
+      <img class="sign-in-icon" src="ndaicon.png" alt="" aria-hidden="true">
       <button class="primary" type="button" [disabled]="loadingAuth" (click)="startSignIn()">
         {{ loadingAuth ? 'Signing in' : 'Sign in with RAS' }}
       </button>
@@ -165,7 +169,7 @@
               <td>
                 <div class="download-indicator" [attr.aria-label]="downloadIndicatorLabel(file)">
                   <span *ngIf="isFileDownloadActive(file)" class="download-spinner" aria-hidden="true"></span>
-                  <span *ngIf="isFileDownloadComplete(file)" class="download-check" aria-hidden="true">✓</span>
+                  <span *ngIf="isFileDownloadComplete(file)" class="download-check" aria-hidden="true">&#10003;</span>
                 </div>
               </td>
               <td class="show-cell">

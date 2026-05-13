@@ -11,6 +11,7 @@ import { bearerHeaders, trimTrailingSlash } from './auth.service';
 @Injectable({ providedIn: 'root' })
 export class PackageService {
   private readonly fileCache = new Map<string, PackageFileDto[]>();
+  private readonly fileRequests = new Map<string, Promise<PackageFileDto[]>>();
 
   constructor(private readonly http: HttpClient) {}
 
@@ -71,17 +72,29 @@ export class PackageService {
 
   clearFileCache(): void {
     this.fileCache.clear();
+    this.fileRequests.clear();
   }
 
   private async fetchAndCacheFiles(host: string, token: string, packageId: number): Promise<PackageFileDto[]> {
-    const response = await firstValueFrom(this.http.get<unknown>(
+    const key = this.fileCacheKey(host, packageId);
+    const inFlight = this.fileRequests.get(key);
+    if (inFlight) {
+      return inFlight;
+    }
+
+    const request = firstValueFrom(this.http.get<unknown>(
       `${trimTrailingSlash(host)}/api/package/${packageId}/files`,
       { headers: bearerHeaders(token) }
-    ));
-    const files = normalizePackageFilesResponse(response);
+    )).then((response) => {
+      const files = normalizePackageFilesResponse(response);
+      this.fileCache.set(key, files);
+      return files;
+    }).finally(() => {
+      this.fileRequests.delete(key);
+    });
 
-    this.fileCache.set(this.fileCacheKey(host, packageId), files);
-    return files;
+    this.fileRequests.set(key, request);
+    return request;
   }
 
   private fileCacheKey(host: string, packageId: number): string {
@@ -104,15 +117,53 @@ async function runLimited<T>(items: T[], limit: number, worker: (item: T) => Pro
 }
 
 function errorMessage(error: unknown): string {
-  if (error instanceof Error) {
+  if (error instanceof Error && error.message) {
     return error.message;
   }
 
-  if (typeof error === 'string') {
-    return error;
+  if (typeof error === 'string' && error.trim()) {
+    return error.trim();
+  }
+
+  if (error && typeof error === 'object') {
+    const record = error as Record<string, unknown>;
+    const directMessage = stringValue(record['message']);
+    const nestedMessage = stringValue(record['error'])
+      || stringValue((record['error'] as Record<string, unknown> | null)?.['message'])
+      || stringValue((record['error'] as Record<string, unknown> | null)?.['errorMessage']);
+
+    if (directMessage && nestedMessage && directMessage !== nestedMessage) {
+      return `${directMessage}: ${nestedMessage}`;
+    }
+
+    if (directMessage) {
+      return directMessage;
+    }
+
+    if (nestedMessage) {
+      return nestedMessage;
+    }
+
+    const status = stringValue(record['status']);
+    const statusText = stringValue(record['statusText']);
+    if (status) {
+      return `Request failed with HTTP ${status}${statusText ? ` ${statusText}` : ''}.`;
+    }
   }
 
   return 'An unexpected error occurred.';
+}
+
+function stringValue(value: unknown): string | null {
+  if (typeof value === 'string' && value.trim()) {
+    return value.trim();
+  }
+
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return String(value);
+  }
+
+  return null;
 }
 
 function normalizePackageFilesResponse(response: unknown): PackageFileDto[] {

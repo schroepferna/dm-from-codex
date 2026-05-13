@@ -40,6 +40,7 @@ export interface DownloadStartRequest {
   targetDir: string;
   files: NativeFileInput[];
   fileConcurrency?: number;
+  tokenConcurrency?: number;
   chunkConcurrency?: number;
 }
 
