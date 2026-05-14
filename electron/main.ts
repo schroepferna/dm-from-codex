@@ -1,7 +1,7 @@
 import { app, BrowserWindow, dialog, ipcMain, net, shell, WebContents } from 'electron';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
-import { mkdir, open, rename, rm, stat, statfs } from 'node:fs/promises';
+import { mkdir, open, readFile, rename, rm, stat, statfs, writeFile } from 'node:fs/promises';
 import https from 'node:https';
 import path from 'node:path';
 import { Readable, Transform } from 'node:stream';
@@ -14,11 +14,13 @@ const DEFAULT_FILE_CONCURRENCY = 2;
 const DEFAULT_TOKEN_CONCURRENCY = 8;
 const DEFAULT_CHUNK_CONCURRENCY = 4;
 const CHUNK_SIZE_BYTES = 64 * 1024 * 1024;
+const PART_MANIFEST_VERSION = 1;
 const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
 const AUTH_CALLBACK_TTL_MS = 5 * 60 * 1000;
 const AUTH_REQUEST_TIMEOUT_MS = 30000;
 const DISK_SPACE_TIMEOUT_MS = 15000;
 const ZENDESK_TOKEN = process.env['NDA_DM_ZENDESK_TOKEN'] || '';
+const ZENDESK_REQUEST_URL = 'https://ndar.zendesk.com/api/v2/requests.json';
 
 interface NativeFileInput {
   packageFileId: number;
@@ -107,6 +109,30 @@ interface Deferred<T> {
   resolve: (value: T) => void;
 }
 
+interface DownloadChunk {
+  index: number;
+  start: number;
+  end: number;
+}
+
+interface PartManifest {
+  version: typeof PART_MANIFEST_VERSION;
+  packageFileId: number;
+  downloadAlias: string;
+  fileSize: number;
+  chunkSize: number;
+  bucket: string;
+  key: string;
+  completedChunks: number[];
+  updatedAt: string;
+}
+
+interface PartialDownloadState {
+  manifestPath: string;
+  completedChunks: Set<number>;
+  completedBytes: number;
+}
+
 interface HelpRequest {
   name: string;
   username: string;
@@ -119,6 +145,8 @@ let mainWindow: BrowserWindow | null = null;
 let authWindow: BrowserWindow | null = null;
 const authWindows = new Set<BrowserWindow>();
 let pendingAuthCallback: { url: string; sessionId: string } | null = null;
+let authFlowCompleted = false;
+let authCancellationNotified = false;
 const jobs = new Map<string, DownloadJob>();
 
 const startupProtocolUrl = findProtocolUrl(process.argv);
@@ -226,11 +254,13 @@ async function createWindow(): Promise<void> {
 }
 
 function getAppIconPath(): string {
-  return path.join(__dirname, '..', 'ndaicon.ico');
+  return path.join(__dirname, '..', 'assets', 'ndaicon.ico');
 }
 
 async function openPrivateAuthWindow(authUrl: string): Promise<void> {
   closeAuthWindow();
+  authFlowCompleted = false;
+  authCancellationNotified = false;
 
   const authPartition = `auth-${randomUUID()}`;
   authWindow = new BrowserWindow({
@@ -251,7 +281,13 @@ async function openPrivateAuthWindow(authUrl: string): Promise<void> {
 
   configureAuthWindow(authWindow, authPartition);
 
-  await authWindow.loadURL(authUrl);
+  const currentWindow = authWindow;
+  void currentWindow.loadURL(authUrl).catch((error) => {
+    if (!currentWindow.isDestroyed()) {
+      notifyAuthCancelled(error instanceof Error ? error.message : 'Sign-in page failed to load.');
+      currentWindow.close();
+    }
+  });
 }
 
 function configureAuthWindow(window: BrowserWindow, authPartition: string): void {
@@ -261,6 +297,10 @@ function configureAuthWindow(window: BrowserWindow, authPartition: string): void
     authWindows.delete(window);
     if (authWindow === window) {
       authWindow = null;
+    }
+
+    if (authWindows.size === 0 && !authFlowCompleted && !pendingAuthCallback) {
+      notifyAuthCancelled('Sign-in was not completed.');
     }
   });
 
@@ -314,9 +354,23 @@ function handleAuthNavigation(url: string): boolean {
     return false;
   }
 
-  handleAuthCallback(callbackUrl);
+  if (!handleAuthCallback(callbackUrl)) {
+    notifyAuthCancelled('Sign-in did not return a session.');
+  }
   closeAuthWindow();
   return true;
+}
+
+function notifyAuthCancelled(message: string): void {
+  if (authFlowCompleted || authCancellationNotified) {
+    return;
+  }
+
+  authCancellationNotified = true;
+
+  if (mainWindow && !mainWindow.webContents.isDestroyed()) {
+    mainWindow.webContents.send('auth:cancelled', { message });
+  }
 }
 
 function closeAuthWindow(): void {
@@ -347,15 +401,16 @@ function getPackagedRendererIndex(): string {
   return match;
 }
 
-function handleAuthCallback(rawUrl: string): void {
+function handleAuthCallback(rawUrl: string): boolean {
   const sessionId = extractSessionId(rawUrl);
 
   if (!sessionId) {
     console.warn('Received an auth callback without a session id.');
-    return;
+    return false;
   }
 
   console.info('Received RAS auth callback.');
+  authFlowCompleted = true;
   const callback = { url: rawUrl, sessionId };
   pendingAuthCallback = callback;
 
@@ -368,6 +423,8 @@ function handleAuthCallback(rawUrl: string): void {
       pendingAuthCallback = null;
     }
   }, AUTH_CALLBACK_TTL_MS);
+
+  return true;
 }
 
 function protocolUrlFromAdditionalData(additionalData: unknown): string | null {
@@ -442,6 +499,11 @@ function registerIpcHandlers(): void {
     const callback = pendingAuthCallback;
     pendingAuthCallback = null;
     return callback;
+  });
+
+  ipcMain.handle('shell:open-external-url', async (_event, url: string) => {
+    assertHttpUrl(url);
+    await shell.openExternal(url);
   });
 
   ipcMain.handle('auth:complete-sign-in', async (_event, request: AuthCompleteRequest) => {
@@ -677,8 +739,9 @@ async function scanDownloadDirectory(request: ScanDownloadRequest): Promise<unkn
 
   const packageTargetDir = resolvePackageTargetDir(request.targetDir, Number(request.packageId));
   return Promise.all(request.files.map(async (file) => {
+    const filePath = resolveInside(packageTargetDir, file.downloadAlias);
+
     try {
-      const filePath = resolveInside(packageTargetDir, file.downloadAlias);
       const fileStat = await stat(filePath);
       return {
         packageFileId: file.packageFileId,
@@ -690,6 +753,11 @@ async function scanDownloadDirectory(request: ScanDownloadRequest): Promise<unkn
         path: filePath
       };
     } catch (error) {
+      const partial = await getPartialDownloadScanResult(filePath, file);
+      if (partial) {
+        return partial;
+      }
+
       const message = error instanceof Error ? error.message : 'File not found.';
       return {
         packageFileId: file.packageFileId,
@@ -723,9 +791,6 @@ async function runDownloadJob(job: DownloadJob): Promise<void> {
       });
     }
 
-    sendDownloadEvent(job, { status: 'queued', message: 'Checking disk space.' });
-    await withTimeout(checkDownloadDiskSpace(job), DISK_SPACE_TIMEOUT_MS, 'Checking disk space timed out before the download could start.');
-
     const packageTargetDir = resolvePackageTargetDir(job.request.targetDir, job.request.packageId);
     await mkdir(packageTargetDir, { recursive: true });
     sendDownloadEvent(job, { status: 'queued', message: 'Checking existing files.' });
@@ -735,6 +800,9 @@ async function runDownloadJob(job: DownloadJob): Promise<void> {
       sendDownloadEvent(job, { status: 'job-complete', message: 'Download complete.' });
       return;
     }
+
+    sendDownloadEvent(job, { status: 'queued', message: 'Checking disk space.' });
+    await withTimeout(checkDownloadDiskSpace(job, filesToDownload), DISK_SPACE_TIMEOUT_MS, 'Checking disk space timed out before the download could start.');
 
     sendDownloadEvent(job, {
       status: 'fetching-token',
@@ -761,7 +829,7 @@ async function runDownloadJob(job: DownloadJob): Promise<void> {
     if (!wasCancelled) {
       job.abortController.abort();
     }
-    sendDownloadEvent(job, { status: wasCancelled ? 'cancelled' : 'error', message });
+    sendDownloadEvent(job, { status: wasCancelled ? 'cancelled' : 'error', message: wasCancelled ? 'Download cancelled.' : message });
   } finally {
     job.paused = false;
     releasePauseWaiters(job);
@@ -853,8 +921,14 @@ function createDeferred<T>(): Deferred<T> {
   return { promise, resolve };
 }
 
-async function checkDownloadDiskSpace(job: DownloadJob): Promise<void> {
-  const requiredBytes = job.request.files.reduce((total, file) => total + Math.max(file.fileSize, 0), 0);
+async function checkDownloadDiskSpace(job: DownloadJob, files: NativeFileInput[]): Promise<void> {
+  const remainingBytes = new Array<number>(files.length).fill(0);
+
+  await runLimited(files.map((file, index) => ({ file, index })), 16, async ({ file, index }) => {
+    remainingBytes[index] = await getRemainingDownloadBytes(job, file);
+  });
+
+  const requiredBytes = remainingBytes.reduce((total, bytes) => total + bytes, 0);
   const space = await getAvailableSpace(job.request.targetDir);
 
   if (space.availableBytes >= requiredBytes) {
@@ -1060,15 +1134,18 @@ async function downloadOneFile(job: DownloadJob, file: NativeFileInput): Promise
 
     const tempPath = `${finalPath}.part`;
     await waitForResume(job);
-    await rm(tempPath, { force: true });
+    const partialState = totalBytes > 0
+      ? await preparePartialDownload(tempPath, file, totalBytes, s3Location.bucket, s3Location.key)
+      : null;
 
     sendDownloadEvent(job, {
       packageFileId: file.packageFileId,
       downloadAlias: file.downloadAlias,
       status: 'downloading',
-      receivedBytes: 0,
+      receivedBytes: partialState?.completedBytes ?? 0,
       totalBytes,
-      path: finalPath
+      path: finalPath,
+      message: partialState && partialState.completedBytes > 0 ? `Resuming from ${formatBytes(partialState.completedBytes)}.` : undefined
     });
 
     if (totalBytes === 0) {
@@ -1076,12 +1153,14 @@ async function downloadOneFile(job: DownloadJob, file: NativeFileInput): Promise
       const handle = await open(tempPath, 'w');
       await handle.close();
     } else {
-      await downloadS3Object(job, client, s3Location.bucket, s3Location.key, tempPath, file, totalBytes);
+      await downloadS3Object(job, client, s3Location.bucket, s3Location.key, tempPath, file, totalBytes, partialState);
+      await ensureFileSize(tempPath, totalBytes);
     }
 
     await waitForResume(job);
     await rm(finalPath, { force: true });
     await rename(tempPath, finalPath);
+    await rm(getPartManifestPath(tempPath), { force: true });
 
     sendDownloadEvent(job, {
       packageFileId: file.packageFileId,
@@ -1260,16 +1339,19 @@ async function downloadS3Object(
   key: string,
   tempPath: string,
   file: NativeFileInput,
-  totalBytes: number
+  totalBytes: number,
+  partialState: PartialDownloadState | null
 ): Promise<void> {
-  const handle = await open(tempPath, 'w');
-  await handle.truncate(totalBytes);
-  await handle.close();
-
   const chunks = createChunks(totalBytes, CHUNK_SIZE_BYTES);
-  const emitProgress = createProgressEmitter(job, file, totalBytes);
+  const completedChunks = partialState?.completedChunks ?? new Set<number>();
+  const emitProgress = createProgressEmitter(job, file, totalBytes, partialState?.completedBytes ?? 0);
+  let manifestWrite = Promise.resolve();
 
   await runLimited(chunks, clamp(job.request.chunkConcurrency || DEFAULT_CHUNK_CONCURRENCY, 1, 8), async (chunk) => {
+    if (completedChunks.has(chunk.index)) {
+      return;
+    }
+
     await waitForResume(job);
 
     if (job.abortController.signal.aborted) {
@@ -1282,16 +1364,41 @@ async function downloadS3Object(
       Range: `bytes=${chunk.start}-${chunk.end}`
     }), { abortSignal: job.abortController.signal });
 
-    const body = toReadable(response.Body);
-    body.on('data', (buffer: Buffer) => emitProgress(buffer.length));
-
     const writeStream = fs.createWriteStream(tempPath, {
       flags: 'r+',
       start: chunk.start
     });
+    const expectedChunkBytes = chunk.end - chunk.start + 1;
+    let receivedChunkBytes = 0;
 
-    await pipeline(body, createPauseGate(job), writeStream, { signal: job.abortController.signal });
+    await pipeline(
+      toReadable(response.Body),
+      createPauseGate(job, (buffer) => {
+        receivedChunkBytes += buffer.length;
+        emitProgress(buffer.length);
+      }),
+      writeStream,
+      { signal: job.abortController.signal }
+    );
+
+    if (receivedChunkBytes !== expectedChunkBytes) {
+      throw new Error(`Download chunk was incomplete for ${file.downloadAlias}.`);
+    }
+
+    completedChunks.add(chunk.index);
+    if (partialState) {
+      manifestWrite = manifestWrite.then(() => writePartManifest(partialState.manifestPath, createPartManifest(
+        file,
+        totalBytes,
+        bucket,
+        key,
+        completedChunks
+      )));
+      await manifestWrite;
+    }
   });
+
+  await manifestWrite;
 }
 
 async function fetchObjectSize(client: S3Client, bucket: string, key: string, abortSignal: AbortSignal): Promise<number> {
@@ -1303,8 +1410,234 @@ async function fetchObjectSize(client: S3Client, bucket: string, key: string, ab
   return response.ContentLength ?? 0;
 }
 
-function createProgressEmitter(job: DownloadJob, file: NativeFileInput, totalBytes: number): (bytes: number) => void {
-  let receivedBytes = 0;
+async function preparePartialDownload(
+  tempPath: string,
+  file: NativeFileInput,
+  totalBytes: number,
+  bucket: string,
+  key: string
+): Promise<PartialDownloadState> {
+  const manifestPath = getPartManifestPath(tempPath);
+  const tempStat = await statIfExists(tempPath);
+  const existingManifest = await readPartManifest(manifestPath);
+
+  if (tempStat && existingManifest && isPartManifestValid(existingManifest, file, totalBytes, bucket, key)) {
+    const completedChunks = normalizeCompletedChunks(existingManifest.completedChunks, totalBytes);
+    if (tempStat.size >= completedHighWaterMark(completedChunks, totalBytes)) {
+      if (tempStat.size > totalBytes) {
+        await ensureFileSize(tempPath, totalBytes);
+      }
+      return {
+        manifestPath,
+        completedChunks,
+        completedBytes: completedBytesForChunks(completedChunks, totalBytes)
+      };
+    }
+  }
+
+  await rm(tempPath, { force: true });
+  await rm(manifestPath, { force: true });
+  await createEmptyFile(tempPath);
+
+  const completedChunks = new Set<number>();
+  await writePartManifest(manifestPath, createPartManifest(file, totalBytes, bucket, key, completedChunks));
+
+  return {
+    manifestPath,
+    completedChunks,
+    completedBytes: 0
+  };
+}
+
+async function getRemainingDownloadBytes(job: DownloadJob, file: NativeFileInput): Promise<number> {
+  if (file.fileSize <= 0) {
+    return 0;
+  }
+
+  const finalPath = resolveInside(resolvePackageTargetDir(job.request.targetDir, job.request.packageId), file.downloadAlias);
+  const existing = await statIfExists(finalPath);
+  if (existing && existing.size === file.fileSize) {
+    return 0;
+  }
+
+  const tempPath = `${finalPath}.part`;
+  const tempStat = await statIfExists(tempPath);
+  if (!tempStat) {
+    return file.fileSize;
+  }
+
+  const manifest = await readPartManifest(getPartManifestPath(tempPath));
+  if (!manifest || !isPartManifestValidForFile(manifest, file, file.fileSize)) {
+    return file.fileSize;
+  }
+
+  const completedChunks = normalizeCompletedChunks(manifest.completedChunks, file.fileSize);
+  if (tempStat.size < completedHighWaterMark(completedChunks, file.fileSize)) {
+    return file.fileSize;
+  }
+
+  return Math.max(0, file.fileSize - completedBytesForChunks(completedChunks, file.fileSize));
+}
+
+async function getPartialDownloadScanResult(filePath: string, file: NativeFileInput): Promise<unknown | null> {
+  if (file.fileSize <= 0) {
+    return null;
+  }
+
+  const tempPath = `${filePath}.part`;
+  const tempStat = await statIfExists(tempPath);
+  if (!tempStat) {
+    return null;
+  }
+
+  const manifest = await readPartManifest(getPartManifestPath(tempPath));
+  let completedBytes = 0;
+
+  if (manifest && isPartManifestValidForFile(manifest, file, file.fileSize)) {
+    const completedChunks = normalizeCompletedChunks(manifest.completedChunks, file.fileSize);
+    if (tempStat.size >= completedHighWaterMark(completedChunks, file.fileSize)) {
+      completedBytes = completedBytesForChunks(completedChunks, file.fileSize);
+    }
+  }
+
+  return {
+    packageFileId: file.packageFileId,
+    downloadAlias: file.downloadAlias,
+    exists: true,
+    complete: false,
+    size: completedBytes,
+    modifiedAt: tempStat.mtime.toISOString(),
+    path: null,
+    error: completedBytes > 0 ? 'Partial download found.' : 'Partial download file found without resumable progress.'
+  };
+}
+
+async function createEmptyFile(filePath: string): Promise<void> {
+  const handle = await open(filePath, 'w');
+  await handle.close();
+}
+
+async function ensureFileSize(filePath: string, size: number): Promise<void> {
+  const existing = await statIfExists(filePath);
+  if (existing?.size === size) {
+    return;
+  }
+
+  const handle = await open(filePath, existing ? 'r+' : 'w+');
+  try {
+    await handle.truncate(size);
+  } finally {
+    await handle.close();
+  }
+}
+
+function getPartManifestPath(tempPath: string): string {
+  return `${tempPath}.manifest.json`;
+}
+
+async function readPartManifest(manifestPath: string): Promise<PartManifest | null> {
+  try {
+    const raw = await readFile(manifestPath, 'utf8');
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object') {
+      return null;
+    }
+
+    const record = parsed as Partial<PartManifest>;
+    if (
+      record.version !== PART_MANIFEST_VERSION ||
+      typeof record.packageFileId !== 'number' ||
+      typeof record.downloadAlias !== 'string' ||
+      typeof record.fileSize !== 'number' ||
+      typeof record.chunkSize !== 'number' ||
+      typeof record.bucket !== 'string' ||
+      typeof record.key !== 'string' ||
+      !Array.isArray(record.completedChunks)
+    ) {
+      return null;
+    }
+
+    return {
+      version: PART_MANIFEST_VERSION,
+      packageFileId: record.packageFileId,
+      downloadAlias: record.downloadAlias,
+      fileSize: record.fileSize,
+      chunkSize: record.chunkSize,
+      bucket: record.bucket,
+      key: record.key,
+      completedChunks: record.completedChunks.filter((value): value is number => Number.isInteger(value)),
+      updatedAt: typeof record.updatedAt === 'string' ? record.updatedAt : ''
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function writePartManifest(manifestPath: string, manifest: PartManifest): Promise<void> {
+  const tempManifestPath = `${manifestPath}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
+  await writeFile(tempManifestPath, `${JSON.stringify(manifest)}\n`, 'utf8');
+  await rename(tempManifestPath, manifestPath);
+}
+
+function createPartManifest(
+  file: NativeFileInput,
+  totalBytes: number,
+  bucket: string,
+  key: string,
+  completedChunks: Set<number>
+): PartManifest {
+  return {
+    version: PART_MANIFEST_VERSION,
+    packageFileId: file.packageFileId,
+    downloadAlias: file.downloadAlias,
+    fileSize: totalBytes,
+    chunkSize: CHUNK_SIZE_BYTES,
+    bucket,
+    key,
+    completedChunks: Array.from(completedChunks).sort((left, right) => left - right),
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function isPartManifestValid(
+  manifest: PartManifest,
+  file: NativeFileInput,
+  totalBytes: number,
+  bucket: string,
+  key: string
+): boolean {
+  return isPartManifestValidForFile(manifest, file, totalBytes)
+    && manifest.bucket === bucket
+    && manifest.key === key;
+}
+
+function isPartManifestValidForFile(manifest: PartManifest, file: NativeFileInput, totalBytes: number): boolean {
+  return manifest.version === PART_MANIFEST_VERSION
+    && manifest.packageFileId === file.packageFileId
+    && manifest.downloadAlias === file.downloadAlias
+    && manifest.fileSize === totalBytes
+    && manifest.chunkSize === CHUNK_SIZE_BYTES;
+}
+
+function normalizeCompletedChunks(values: number[], totalBytes: number): Set<number> {
+  const chunkCount = createChunks(totalBytes, CHUNK_SIZE_BYTES).length;
+  return new Set(values.filter((value) => Number.isInteger(value) && value >= 0 && value < chunkCount));
+}
+
+function completedBytesForChunks(completedChunks: Set<number>, totalBytes: number): number {
+  return createChunks(totalBytes, CHUNK_SIZE_BYTES)
+    .filter((chunk) => completedChunks.has(chunk.index))
+    .reduce((total, chunk) => total + chunk.end - chunk.start + 1, 0);
+}
+
+function completedHighWaterMark(completedChunks: Set<number>, totalBytes: number): number {
+  return createChunks(totalBytes, CHUNK_SIZE_BYTES)
+    .filter((chunk) => completedChunks.has(chunk.index))
+    .reduce((highWaterMark, chunk) => Math.max(highWaterMark, chunk.end + 1), 0);
+}
+
+function createProgressEmitter(job: DownloadJob, file: NativeFileInput, totalBytes: number, initialBytes = 0): (bytes: number) => void {
+  let receivedBytes = initialBytes;
   let lastSentAt = 0;
 
   return (bytes: number) => {
@@ -1326,11 +1659,16 @@ function createProgressEmitter(job: DownloadJob, file: NativeFileInput, totalByt
   };
 }
 
-function createPauseGate(job: DownloadJob): Transform {
+function createPauseGate(job: DownloadJob, onChunk?: (chunk: Buffer) => void): Transform {
   return new Transform({
     transform(chunk, _encoding, callback) {
       void waitForResume(job)
-        .then(() => callback(null, chunk))
+        .then(() => {
+          if (onChunk && Buffer.isBuffer(chunk)) {
+            onChunk(chunk);
+          }
+          callback(null, chunk);
+        })
         .catch((error) => callback(error instanceof Error ? error : new Error('Download cancelled.')));
     }
   });
@@ -1358,32 +1696,44 @@ async function submitHelpRequest(request: HelpRequest): Promise<{ ok: boolean; s
     throw new Error('Zendesk token is not configured.');
   }
 
+  const commentBody = [
+    `NAME`,
+    request.name,
+    '',
+    `USERNAME`,
+    request.username,
+    '',
+    `MESSAGE`,
+    request.message
+  ].join('\n');
+
   const payload = {
-    ticket: {
+    request: {
       subject: `Download Manager Help Request from ${request.email}`,
       requester: {
         name: request.name,
         email: request.email
       },
       comment: {
-        html_body: [
-          `<p><strong>NAME</strong><br>${escapeHtml(request.name)}</p>`,
-          `<p><strong>USERNAME</strong><br>${escapeHtml(request.username)}</p>`,
-          `<p><strong>MESSAGE</strong><br>${escapeHtml(request.message).replace(/\n/g, '<br>')}</p>`
-        ].join('')
+        body: commentBody
       },
       custom_fields: []
     }
   };
 
-  const response = await fetch('https://ndar.zendesk.com/hc/requests', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${zendeskToken}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify(payload)
-  });
+  let response: Response;
+  try {
+    response = await fetchWithTimeout(ZENDESK_REQUEST_URL, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${zendeskToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    }, 'Help request timed out.');
+  } catch (error) {
+    throw new Error(helpSubmissionErrorMessage(error));
+  }
 
   if (!response.ok) {
     const detail = await response.text().catch(() => '');
@@ -1395,6 +1745,19 @@ async function submitHelpRequest(request: HelpRequest): Promise<{ ok: boolean; s
     status: response.status,
     message: 'Help request sent.'
   };
+}
+
+function helpSubmissionErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : '';
+  if (message === 'Help request timed out.') {
+    return message;
+  }
+
+  if (!message || message === 'fetch failed') {
+    return 'Help request could not be sent. Check your network connection or VPN and try again.';
+  }
+
+  return `Help request could not be sent. ${message}`;
 }
 
 function validateDownloadStartRequest(request: DownloadStartRequest): void {
@@ -1490,11 +1853,12 @@ function parseS3Uri(sourceUri: string): { bucket: string; key: string } {
   };
 }
 
-function createChunks(totalBytes: number, chunkSize: number): Array<{ start: number; end: number }> {
-  const chunks: Array<{ start: number; end: number }> = [];
+function createChunks(totalBytes: number, chunkSize: number): DownloadChunk[] {
+  const chunks: DownloadChunk[] = [];
 
-  for (let start = 0; start < totalBytes; start += chunkSize) {
+  for (let start = 0, index = 0; start < totalBytes; start += chunkSize, index += 1) {
     chunks.push({
+      index,
       start,
       end: Math.min(start + chunkSize - 1, totalBytes - 1)
     });
@@ -1532,7 +1896,7 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
-async function fetchWithTimeout(url: string, init: RequestInit = {}): Promise<Response> {
+async function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMessage = 'RAS request timed out.'): Promise<Response> {
   const abortController = new AbortController();
   const upstreamSignal = init.signal;
   let timedOut = false;
@@ -1559,7 +1923,7 @@ async function fetchWithTimeout(url: string, init: RequestInit = {}): Promise<Re
     });
   } catch (error) {
     if (timedOut) {
-      throw new Error('RAS request timed out.');
+      throw new Error(timeoutMessage);
     }
 
     throw error;
@@ -1571,13 +1935,4 @@ async function fetchWithTimeout(url: string, init: RequestInit = {}): Promise<Re
 
 function trimTrailingSlash(value: string): string {
   return value.replace(/\/+$/, '');
-}
-
-function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
 }

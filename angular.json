@@ -27,13 +27,8 @@
             "tsConfig": "tsconfig.app.json",
               "assets": [
                 {
-                  "glob": "ndaicon.ico",
-                  "input": ".",
-                  "output": "."
-                },
-                {
-                  "glob": "ndaicon.png",
-                  "input": ".",
+                  "glob": "**/*",
+                  "input": "assets",
                   "output": "."
                 }
               ],

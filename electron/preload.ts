@@ -2,6 +2,7 @@ import { contextBridge, ipcRenderer } from 'electron';
 
 contextBridge.exposeInMainWorld('ndaDm', {
   openAuthUrl: (url: string) => ipcRenderer.invoke('auth:open-url', url),
+  openExternalUrl: (url: string) => ipcRenderer.invoke('shell:open-external-url', url),
   getPendingAuthCallback: () => ipcRenderer.invoke('auth:get-pending-callback'),
   completeSignIn: (request: unknown) => ipcRenderer.invoke('auth:complete-sign-in', request),
   verifySession: (request: unknown) => ipcRenderer.invoke('auth:verify-session', request),
@@ -20,6 +21,11 @@ contextBridge.exposeInMainWorld('ndaDm', {
     const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => callback(payload);
     ipcRenderer.on('auth:callback', listener);
     return () => ipcRenderer.removeListener('auth:callback', listener);
+  },
+  onAuthCancelled: (callback: (payload: unknown) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => callback(payload);
+    ipcRenderer.on('auth:cancelled', listener);
+    return () => ipcRenderer.removeListener('auth:cancelled', listener);
   },
   onDownloadEvent: (callback: (payload: unknown) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => callback(payload);

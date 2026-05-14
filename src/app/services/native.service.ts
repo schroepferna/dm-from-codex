@@ -1,6 +1,7 @@
 import { Injectable } from '@angular/core';
 import { Observable } from 'rxjs';
 import {
+  AuthCancelledPayload,
   AuthCallbackPayload,
   AuthCompleteRequest,
   AuthCompleteResponse,
@@ -34,6 +35,10 @@ export class NativeService {
 
   openAuthUrl(url: string): Promise<void> {
     return this.desktopBridge.openAuthUrl(url);
+  }
+
+  openExternalUrl(url: string): Promise<void> {
+    return this.desktopBridge.openExternalUrl(url);
   }
 
   completeSignIn(request: AuthCompleteRequest): Promise<AuthCompleteResponse> {
@@ -105,6 +110,18 @@ export class NativeService {
         })
         .catch((error) => subscriber.error(error));
 
+      return () => unsubscribe();
+    });
+  }
+
+  authCancellations(): Observable<AuthCancelledPayload> {
+    return new Observable((subscriber) => {
+      if (!window.ndaDm) {
+        subscriber.complete();
+        return undefined;
+      }
+
+      const unsubscribe = window.ndaDm.onAuthCancelled((payload) => subscriber.next(payload));
       return () => unsubscribe();
     });
   }

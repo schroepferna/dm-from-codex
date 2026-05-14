@@ -9,7 +9,7 @@ import {
   UiFile,
   UiPackage
 } from './models/package.models';
-import { DownloadEvent, NativeFileInput } from './models/native-api.models';
+import { AuthCancelledPayload, DownloadEvent, NativeFileInput } from './models/native-api.models';
 import { AuthService } from './services/auth.service';
 import { DownloadService } from './services/download.service';
 import { HelpService } from './services/help.service';
@@ -17,6 +17,28 @@ import { NativeService } from './services/native.service';
 import { PackageService } from './services/package.service';
 
 const DOWNLOAD_DIR_STORAGE_KEY = 'nda-download-manager.downloadDir';
+const PACKAGE_PANE_WIDTH_STORAGE_KEY = 'nda-download-manager.packagePaneWidth';
+const DEFAULT_PACKAGE_PANE_WIDTH = 390;
+const MIN_PACKAGE_PANE_WIDTH = 280;
+const MIN_FILE_PANE_WIDTH = 480;
+const PANE_RESIZER_WIDTH = 18;
+const LOGIN_GOV_CREATE_ACCOUNT_URL = 'https://www.login.gov/create-an-account';
+const RAS_NEWS_URL = 'https://nda.nih.gov/nda/ras-news';
+
+interface DownloadTargetSummary {
+  isPackage: boolean;
+  packageName: string;
+  fileNames: string[];
+}
+
+interface PackageDownloadSummary {
+  fileCount: number;
+  downloadableCount: number;
+  allFilesDownloaded: boolean;
+}
+
+type NameSortDirection = 'asc' | 'desc';
+type PackageListSource = 'mine' | 'shared';
 
 @Component({
   selector: 'nda-root',
@@ -33,11 +55,15 @@ export class AppComponent implements OnInit, OnDestroy {
 
   authState: AuthState;
   activeTab: 'mine' | 'shared' = 'mine';
+  myPackageNameSortDirection: NameSortDirection = 'asc';
+  sharedPackageNameSortDirection: NameSortDirection = 'asc';
+  fileNameSortDirection: NameSortDirection = 'asc';
   myPackages: UiPackage[] = [];
   sharedPackages: UiPackage[] = [];
   selectedPackage: UiPackage | null = null;
   files: UiFile[] = [];
   downloadDirectory = window.localStorage.getItem(DOWNLOAD_DIR_STORAGE_KEY) || '';
+  packagePaneWidth = readStoredPackagePaneWidth();
   jobRows: DownloadEvent[] = [];
   showHelp = false;
   helpForm = {
@@ -61,8 +87,13 @@ export class AppComponent implements OnInit, OnDestroy {
   private readonly destroyed$ = new Subject<void>();
   private readonly latestJobEvents = new Map<string, DownloadEvent>();
   private readonly jobFileIds = new Map<string, Set<number>>();
+  private readonly jobDownloadTargets = new Map<string, DownloadTargetSummary>();
+  private readonly packageDownloadSummaries = new Map<number, PackageDownloadSummary>();
+  private readonly nameCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
   private readonly pausedJobIds = new Set<string>();
+  private readonly cancelledJobIds = new Set<string>();
   private completingSessionId: string | null = null;
+  private paneResizeBounds: { left: number; maxWidth: number } | null = null;
   private readonly handleBeforeUnload = () => {
     this.clearTransientErrors();
     this.auth.clearAuthCache();
@@ -70,6 +101,14 @@ export class AppComponent implements OnInit, OnDestroy {
   private readonly handlePageShow = () => {
     this.clearTransientErrors();
     this.changeDetector.detectChanges();
+  };
+  private readonly handlePaneResizeMove = (event: PointerEvent) => {
+    this.updatePackagePaneWidth(event.clientX);
+  };
+  private readonly handlePaneResizeEnd = () => {
+    window.removeEventListener('pointermove', this.handlePaneResizeMove);
+    window.removeEventListener('pointerup', this.handlePaneResizeEnd);
+    this.paneResizeBounds = null;
   };
 
   constructor(
@@ -104,6 +143,12 @@ export class AppComponent implements OnInit, OnDestroy {
         this.zone.run(() => void this.completeSignIn(payload.sessionId));
       });
 
+    this.native.authCancellations()
+      .pipe(takeUntil(this.destroyed$))
+      .subscribe((payload) => {
+        this.zone.run(() => this.handleAuthCancelled(payload));
+      });
+
     this.downloads.events$
       .pipe(takeUntil(this.destroyed$))
       .subscribe((event) => {
@@ -124,6 +169,7 @@ export class AppComponent implements OnInit, OnDestroy {
   ngOnDestroy(): void {
     window.removeEventListener('beforeunload', this.handleBeforeUnload);
     window.removeEventListener('pageshow', this.handlePageShow);
+    this.handlePaneResizeEnd();
     this.auth.clearAuthCache();
     this.packages.clearFileCache();
     this.destroyed$.next();
@@ -153,6 +199,46 @@ export class AppComponent implements OnInit, OnDestroy {
     return this.startingDownload || this.jobRows.some((job) => !this.isTerminalJob(job));
   }
 
+  get paneGridColumns(): string {
+    return `minmax(${MIN_PACKAGE_PANE_WIDTH}px, ${this.packagePaneWidth}px) ${PANE_RESIZER_WIDTH}px minmax(0, 1fr)`;
+  }
+
+  startPaneResize(event: PointerEvent, grid: HTMLElement): void {
+    if (event.pointerType === 'mouse' && event.button !== 0) {
+      return;
+    }
+
+    event.preventDefault();
+    const rect = grid.getBoundingClientRect();
+    const maxWidth = Math.max(MIN_PACKAGE_PANE_WIDTH, rect.width - MIN_FILE_PANE_WIDTH - PANE_RESIZER_WIDTH);
+    this.paneResizeBounds = {
+      left: rect.left,
+      maxWidth
+    };
+    this.updatePackagePaneWidth(event.clientX);
+    window.addEventListener('pointermove', this.handlePaneResizeMove);
+    window.addEventListener('pointerup', this.handlePaneResizeEnd, { once: true });
+  }
+
+  resizePaneWithKeyboard(event: KeyboardEvent, grid: HTMLElement): void {
+    let nextWidth = this.packagePaneWidth;
+
+    if (event.key === 'ArrowLeft') {
+      nextWidth -= 24;
+    } else if (event.key === 'ArrowRight') {
+      nextWidth += 24;
+    } else if (event.key === 'Home') {
+      nextWidth = MIN_PACKAGE_PANE_WIDTH;
+    } else if (event.key === 'End') {
+      nextWidth = this.maxPackagePaneWidth(grid);
+    } else {
+      return;
+    }
+
+    event.preventDefault();
+    this.setPackagePaneWidth(nextWidth, this.maxPackagePaneWidth(grid));
+  }
+
   async startSignIn(): Promise<void> {
     this.clearMessages();
     this.loadingAuth = true;
@@ -172,6 +258,9 @@ export class AppComponent implements OnInit, OnDestroy {
 
     if (!sessionId) {
       this.errorMessage = 'Session id is required.';
+      this.loadingAuth = false;
+      this.completingSessionId = null;
+      this.changeDetector.detectChanges();
       return;
     }
 
@@ -221,7 +310,10 @@ export class AppComponent implements OnInit, OnDestroy {
     this.jobRows = [];
     this.latestJobEvents.clear();
     this.jobFileIds.clear();
+    this.jobDownloadTargets.clear();
+    this.packageDownloadSummaries.clear();
     this.pausedJobIds.clear();
+    this.cancelledJobIds.clear();
     this.showHelp = false;
     this.helpForm = {
       name: '',
@@ -256,8 +348,8 @@ export class AppComponent implements OnInit, OnDestroy {
         this.packages.getSharedPackages(state.host, state.token)
       ]);
 
-      this.myPackages = myPackages.map((item) => normalizeMyPackage(item));
-      this.sharedPackages = sharedPackages.map((item) => normalizeSharedPackage(item));
+      this.setMyPackages(myPackages.map((item) => normalizeMyPackage(item)));
+      this.setSharedPackages(sharedPackages.map((item) => normalizeSharedPackage(item)));
 
       if (!this.selectedPackage && this.myPackages.length > 0) {
         void this.selectPackage(this.myPackages[0]);
@@ -282,7 +374,7 @@ export class AppComponent implements OnInit, OnDestroy {
 
     const sharedPackagesPromise = this.packages.getSharedPackages(state.host, state.token)
       .then((sharedPackages) => {
-        this.sharedPackages = sharedPackages.map((item) => normalizeSharedPackage(item));
+        this.setSharedPackages(sharedPackages.map((item) => normalizeSharedPackage(item)));
         this.changeDetector.detectChanges();
       });
 
@@ -293,7 +385,7 @@ export class AppComponent implements OnInit, OnDestroy {
 
     try {
       const myPackages = await this.packages.getMyPackages(state.host, state.token);
-      this.myPackages = myPackages.map((item) => normalizeMyPackage(item));
+      this.setMyPackages(myPackages.map((item) => normalizeMyPackage(item)));
 
       if (!this.selectedPackage && this.myPackages.length > 0) {
         void this.selectPackage(this.myPackages[0]);
@@ -348,7 +440,7 @@ export class AppComponent implements OnInit, OnDestroy {
       }
 
       const files = await this.packages.getFiles(this.authState.host, this.authState.token, pkg.id);
-      this.files = files.map((file) => ({
+      this.setFiles(files.map((file) => ({
         ...file,
         selected: false,
         localStatus: 'unknown',
@@ -359,7 +451,8 @@ export class AppComponent implements OnInit, OnDestroy {
         receivedBytes: 0,
         totalBytes: file.file_size,
         errorMessage: null
-      }));
+      })));
+      this.updatePackageDownloadSummary(pkg.id);
       await this.scanDownloads();
     } catch (error) {
       this.errorMessage = errorMessage(error);
@@ -378,23 +471,18 @@ export class AppComponent implements OnInit, OnDestroy {
 
     this.associatingPackageId = pkg.id;
     this.infoMessage = `Adding ${pkg.name} to my packages...`;
-    this.changeDetector.detectChanges();
 
     try {
       const associated = await this.packages.associateSharedPackage(this.authState.host, this.authState.token, pkg.id);
       const normalized = normalizeMyPackage(associated);
-      this.myPackages = [normalized, ...this.myPackages.filter((item) => item.id !== normalized.id)];
-      this.sharedPackages = this.sharedPackages.filter((item) => item.id !== normalized.id);
+      this.setMyPackages([normalized, ...this.myPackages.filter((item) => item.id !== normalized.id)]);
       this.activeTab = 'mine';
-      this.changeDetector.detectChanges();
       await this.selectPackage(normalized);
-      this.infoMessage = 'Package added to My Packages.';
-      this.changeDetector.detectChanges();
+      this.infoMessage = `${normalized.name} is added to My Packages`;
     } catch (error) {
       this.errorMessage = errorMessage(error);
     } finally {
       this.associatingPackageId = null;
-      this.changeDetector.detectChanges();
     }
   }
 
@@ -417,6 +505,10 @@ export class AppComponent implements OnInit, OnDestroy {
 
   async scanDownloads(): Promise<void> {
     if (!this.downloadDirectory || !this.selectedPackage || this.files.length === 0) {
+      if (this.selectedPackage) {
+        this.updatePackageDownloadSummary(this.selectedPackage.id);
+        this.changeDetector.detectChanges();
+      }
       return;
     }
 
@@ -430,7 +522,7 @@ export class AppComponent implements OnInit, OnDestroy {
       });
       const byFileId = new Map(results.map((result) => [result.packageFileId, result]));
 
-      this.files = this.files.map((file) => {
+      this.setFiles(this.files.map((file) => {
         const result = byFileId.get(file.package_file_id);
         if (!result) {
           return {
@@ -454,12 +546,18 @@ export class AppComponent implements OnInit, OnDestroy {
             ? file.downloadStatus
             : null
         };
-      });
+      }));
+      this.updatePackageDownloadSummary(this.selectedPackage.id);
     } catch (error) {
       this.errorMessage = errorMessage(error);
     } finally {
-      this.scanning = false;
-      this.changeDetector.detectChanges();
+      this.zone.run(() => {
+        this.scanning = false;
+        if (this.selectedPackage) {
+          this.updatePackageDownloadSummary(this.selectedPackage.id);
+        }
+        this.changeDetector.detectChanges();
+      });
     }
   }
 
@@ -480,11 +578,71 @@ export class AppComponent implements OnInit, OnDestroy {
   }
 
   async downloadSelected(): Promise<void> {
-    await this.startDownload(this.files.filter((file) => file.selected && this.canSelectFileForDownload(file)));
+    await this.startDownload(
+      this.files.filter((file) => file.selected && this.canSelectFileForDownload(file)),
+      'selection'
+    );
   }
 
-  async downloadPackage(): Promise<void> {
-    await this.startDownload(this.files.filter((file) => this.canSelectFileForDownload(file)));
+  async runPackageAction(pkg: UiPackage): Promise<void> {
+    if (this.packageActionLabel(pkg) === 'Show') {
+      await this.showPackageInFolder(pkg);
+      return;
+    }
+
+    await this.downloadPackage(pkg);
+  }
+
+  packageActionLabel(pkg: UiPackage): 'Download' | 'Show' {
+    return this.isPackageFullyDownloaded(pkg) ? 'Show' : 'Download';
+  }
+
+  isPackageActionDisabled(pkg: UiPackage): boolean {
+    if (this.downloadInProgress) {
+      return true;
+    }
+
+    const summary = this.packageDownloadSummaries.get(pkg.id);
+    return summary?.fileCount === 0;
+  }
+
+  async downloadPackage(pkg: UiPackage | null = this.selectedPackage): Promise<void> {
+    if (!pkg || pkg.source !== 'mine') {
+      this.errorMessage = 'Select a package and sign in first.';
+      return;
+    }
+
+    if (this.downloadInProgress) {
+      this.errorMessage = 'A download is already in progress.';
+      return;
+    }
+
+    if (!this.downloadDirectory) {
+      this.errorMessage = 'Select a download directory.';
+      return;
+    }
+
+    if (this.selectedPackage?.id !== pkg.id) {
+      await this.selectPackage(pkg);
+    }
+
+    if (this.errorMessage) {
+      return;
+    }
+
+    if (this.selectedPackage?.id !== pkg.id) {
+      return;
+    }
+
+    if (this.canShowPackageDownload()) {
+      await this.showPackageInFolder(pkg);
+      return;
+    }
+
+    await this.startDownload(
+      this.files.filter((file) => this.canSelectFileForDownload(file)),
+      'package'
+    );
   }
 
   canShowFile(file: UiFile): boolean {
@@ -501,6 +659,46 @@ export class AppComponent implements OnInit, OnDestroy {
       && this.files.every((file) => this.canShowFile(file));
   }
 
+  isPackageFullyDownloaded(pkg: UiPackage): boolean {
+    return this.packageDownloadSummaries.get(pkg.id)?.allFilesDownloaded === true;
+  }
+
+  togglePackageNameSort(source: PackageListSource): void {
+    if (source === 'mine') {
+      this.myPackageNameSortDirection = nextSortDirection(this.myPackageNameSortDirection);
+      this.setMyPackages(this.myPackages);
+      return;
+    }
+
+    this.sharedPackageNameSortDirection = nextSortDirection(this.sharedPackageNameSortDirection);
+    this.setSharedPackages(this.sharedPackages);
+  }
+
+  packageNameSortLabel(source: PackageListSource): string {
+    const direction = source === 'mine' ? this.myPackageNameSortDirection : this.sharedPackageNameSortDirection;
+    return direction === 'asc' ? 'A-Z' : 'Z-A';
+  }
+
+  packageNameSortAriaLabel(source: PackageListSource): string {
+    const direction = source === 'mine' ? this.myPackageNameSortDirection : this.sharedPackageNameSortDirection;
+    const nextDirection = direction === 'asc' ? 'descending' : 'ascending';
+    return `Sort ${source === 'mine' ? 'My Packages' : 'Shared Packages'} by package name ${nextDirection}`;
+  }
+
+  toggleFileNameSort(): void {
+    this.fileNameSortDirection = nextSortDirection(this.fileNameSortDirection);
+    this.setFiles(this.files);
+  }
+
+  fileNameSortLabel(): string {
+    return this.fileNameSortDirection === 'asc' ? 'A-Z' : 'Z-A';
+  }
+
+  fileNameSortAriaLabel(): string {
+    const nextDirection = this.fileNameSortDirection === 'asc' ? 'descending' : 'ascending';
+    return `Sort package files by file name ${nextDirection}`;
+  }
+
   async showFileInFolder(file: UiFile): Promise<void> {
     try {
       await this.scanDownloads();
@@ -515,12 +713,20 @@ export class AppComponent implements OnInit, OnDestroy {
     }
   }
 
-  async showPackageInFolder(): Promise<void> {
-    if (!this.downloadDirectory || !this.selectedPackage) {
+  async showPackageInFolder(pkg: UiPackage | null = this.selectedPackage): Promise<void> {
+    if (!this.downloadDirectory || !pkg) {
       return;
     }
 
     try {
+      if (this.selectedPackage?.id !== pkg.id) {
+        await this.selectPackage(pkg);
+      }
+
+      if (this.errorMessage || this.selectedPackage?.id !== pkg.id) {
+        return;
+      }
+
       await this.scanDownloads();
       if (!this.canShowPackageDownload()) {
         return;
@@ -528,26 +734,82 @@ export class AppComponent implements OnInit, OnDestroy {
 
       await this.native.showPackageInFolder({
         targetDir: this.downloadDirectory,
-        packageId: this.selectedPackage.id
+        packageId: pkg.id
       });
     } catch (error) {
       this.errorMessage = errorMessage(error);
     }
   }
 
-  async cancelJob(jobId: string): Promise<void> {
-    await this.downloads.cancel(jobId);
+  get activeDownloadPaused(): boolean {
+    const job = this.activeDownloadJob();
+    return Boolean(job && this.isJobPaused(job));
   }
 
-  async pauseJob(jobId: string): Promise<void> {
+  canPauseActiveDownload(): boolean {
+    const job = this.activeDownloadJob();
+    return Boolean(job && (this.canPauseJob(job) || this.canResumeJob(job)));
+  }
+
+  canCancelActiveDownload(): boolean {
+    const job = this.activeDownloadJob();
+    return Boolean(job && this.canCancelJob(job));
+  }
+
+  async togglePauseActiveDownload(): Promise<void> {
+    const job = this.activeDownloadJob();
+    if (!job) {
+      return;
+    }
+
+    if (this.isJobPaused(job)) {
+      await this.resumeJob(job.jobId);
+      return;
+    }
+
+    await this.pauseJob(job.jobId);
+  }
+
+  async cancelActiveDownload(): Promise<void> {
+    const job = this.activeDownloadJob();
+    if (!job) {
+      return;
+    }
+
+    await this.cancelJob(job.jobId);
+  }
+
+  async cancelJob(jobId: string): Promise<void> {
+    this.infoMessage = this.formatDownloadActionMessage('Cancel', jobId);
+    this.cancelledJobIds.add(jobId);
+    this.pausedJobIds.delete(jobId);
+    this.clearJobFilesForCancel(jobId);
+    this.markJobRowStatus(jobId, 'cancelled');
+
     try {
-      await this.downloads.pause(jobId);
+      await this.downloads.cancel(jobId);
     } catch (error) {
       this.errorMessage = errorMessage(error);
     }
   }
 
+  async pauseJob(jobId: string): Promise<void> {
+    this.infoMessage = this.formatDownloadActionMessage('Pause', jobId);
+    this.pausedJobIds.add(jobId);
+    this.applyPausedStatusToJobFiles(jobId);
+    this.markJobRowStatus(jobId, 'paused');
+
+    try {
+      await this.downloads.pause(jobId);
+    } catch (error) {
+      this.pausedJobIds.delete(jobId);
+      this.errorMessage = errorMessage(error);
+    }
+  }
+
   async resumeJob(jobId: string): Promise<void> {
+    this.infoMessage = null;
+
     try {
       await this.downloads.resume(jobId);
     } catch (error) {
@@ -582,6 +844,27 @@ export class AppComponent implements OnInit, OnDestroy {
   openHelp(): void {
     this.showHelp = true;
     this.helpForm.username = this.authState.username || this.helpForm.username;
+  }
+
+  async openLoginGovCreateAccount(): Promise<void> {
+    this.clearMessages();
+
+    try {
+      await this.native.openExternalUrl(LOGIN_GOV_CREATE_ACCOUNT_URL);
+    } catch (error) {
+      this.errorMessage = errorMessage(error);
+    }
+  }
+
+  async openRasNews(event: MouseEvent): Promise<void> {
+    event.preventDefault();
+    this.clearMessages();
+
+    try {
+      await this.native.openExternalUrl(RAS_NEWS_URL);
+    } catch (error) {
+      this.errorMessage = errorMessage(error);
+    }
   }
 
   closeHelp(): void {
@@ -737,7 +1020,45 @@ export class AppComponent implements OnInit, OnDestroy {
     return file.package_file_id;
   }
 
-  private async startDownload(files: UiFile[]): Promise<void> {
+  private setMyPackages(packages: UiPackage[]): void {
+    this.myPackages = this.sortPackagesByName(packages, this.myPackageNameSortDirection);
+  }
+
+  private setSharedPackages(packages: UiPackage[]): void {
+    this.sharedPackages = this.sortPackagesByName(packages, this.sharedPackageNameSortDirection);
+  }
+
+  private setFiles(files: UiFile[]): void {
+    this.files = this.sortFilesByName(files, this.fileNameSortDirection);
+  }
+
+  private sortPackagesByName(packages: UiPackage[], direction: NameSortDirection): UiPackage[] {
+    const multiplier = direction === 'asc' ? 1 : -1;
+
+    return [...packages].sort((left, right) => {
+      const nameCompare = this.nameCollator.compare(left.name, right.name);
+      if (nameCompare !== 0) {
+        return nameCompare * multiplier;
+      }
+
+      return left.id - right.id;
+    });
+  }
+
+  private sortFilesByName(files: UiFile[], direction: NameSortDirection): UiFile[] {
+    const multiplier = direction === 'asc' ? 1 : -1;
+
+    return [...files].sort((left, right) => {
+      const nameCompare = this.nameCollator.compare(left.download_alias, right.download_alias);
+      if (nameCompare !== 0) {
+        return nameCompare * multiplier;
+      }
+
+      return left.package_file_id - right.package_file_id;
+    });
+  }
+
+  private async startDownload(files: UiFile[], mode: 'package' | 'selection'): Promise<void> {
     this.clearMessages();
     const filesToDownload = files.filter((file) => this.canSelectFileForDownload(file));
 
@@ -800,15 +1121,25 @@ export class AppComponent implements OnInit, OnDestroy {
       }), 15000, 'Starting the download job timed out before Electron acknowledged it.');
 
       this.jobFileIds.set(result.jobId, new Set(nativeFiles.map((file) => file.packageFileId)));
-      this.latestJobEvents.set(result.jobId, {
-        jobId: result.jobId,
-        packageId: this.selectedPackage.id,
+      this.jobDownloadTargets.set(result.jobId, {
+        isPackage: mode === 'package',
         packageName: this.selectedPackage.name,
-        status: 'queued',
-        message: startMessage
+        fileNames: nativeFiles.map((file) => file.downloadAlias)
       });
+      if (!this.latestJobEvents.has(result.jobId)) {
+        this.latestJobEvents.set(result.jobId, {
+          jobId: result.jobId,
+          packageId: this.selectedPackage.id,
+          packageName: this.selectedPackage.name,
+          status: 'queued',
+          message: startMessage
+        });
+      }
+      this.applyCurrentJobStateToFiles(result.jobId);
       this.syncJobRows();
-      this.infoMessage = startMessage;
+      if (!this.pausedJobIds.has(result.jobId) && !this.cancelledJobIds.has(result.jobId) && this.latestJobEvents.get(result.jobId)?.status !== 'cancelled') {
+        this.infoMessage = startMessage;
+      }
     } catch (error) {
       this.errorMessage = errorMessage(error);
     } finally {
@@ -823,7 +1154,9 @@ export class AppComponent implements OnInit, OnDestroy {
       if (event.status === 'error') {
         this.latestJobEvents.delete(jobId);
         this.jobFileIds.delete(jobId);
+        this.jobDownloadTargets.delete(jobId);
         this.pausedJobIds.delete(jobId);
+        this.cancelledJobIds.delete(jobId);
         removedJobError = true;
       }
     }
@@ -870,16 +1203,20 @@ export class AppComponent implements OnInit, OnDestroy {
   private handleDownloadEvent(event: DownloadEvent): void {
     if (event.isPaused === true) {
       this.pausedJobIds.add(event.jobId);
-    } else if (event.isPaused === false || event.status === 'job-complete' || event.status === 'error' || event.status === 'cancelled') {
+    } else if ((event.isPaused === false && event.packageFileId === undefined) || event.status === 'job-complete' || event.status === 'error' || event.status === 'cancelled') {
       this.pausedJobIds.delete(event.jobId);
     }
 
-    const previous = this.latestJobEvents.get(event.jobId);
-    this.latestJobEvents.set(event.jobId, {
-      ...previous,
-      ...event
-    });
+    if (event.status === 'cancelled') {
+      this.cancelledJobIds.add(event.jobId);
+    }
+
+    this.updateJobRow(event);
     this.syncJobRows();
+
+    if (event.packageFileId === undefined) {
+      this.applyJobEventToFiles(event);
+    }
 
     if (event.packageFileId !== undefined) {
       this.files = this.files.map((file) => {
@@ -889,10 +1226,15 @@ export class AppComponent implements OnInit, OnDestroy {
 
         const completed = event.status === 'complete' || event.status === 'skipped';
         const totalBytes = event.totalBytes ?? file.totalBytes ?? file.file_size;
+        const downloadStatus = this.cancelledJobIds.has(event.jobId)
+          ? null
+          : this.pausedJobIds.has(event.jobId) && this.isActiveDownloadStatus(event.status)
+            ? 'paused'
+            : event.status;
 
         return {
           ...file,
-          downloadStatus: event.status,
+          downloadStatus,
           receivedBytes: completed ? totalBytes : event.receivedBytes ?? file.receivedBytes,
           totalBytes,
           localStatus: completed ? 'downloaded' : file.localStatus,
@@ -906,12 +1248,16 @@ export class AppComponent implements OnInit, OnDestroy {
 
     if (event.status === 'error') {
       this.jobFileIds.delete(event.jobId);
-      this.errorMessage = event.message || 'Download failed.';
+      this.jobDownloadTargets.delete(event.jobId);
+      this.cancelledJobIds.delete(event.jobId);
+      if (!isAbortMessage(event.message)) {
+        this.errorMessage = event.message || 'Download failed.';
+      }
     }
 
     if (event.status === 'cancelled') {
       this.jobFileIds.delete(event.jobId);
-      this.infoMessage = event.message || 'Download cancelled.';
+      this.jobDownloadTargets.delete(event.jobId);
     }
 
     if (event.status === 'job-complete') {
@@ -936,6 +1282,8 @@ export class AppComponent implements OnInit, OnDestroy {
           };
         });
         this.jobFileIds.delete(event.jobId);
+        this.jobDownloadTargets.delete(event.jobId);
+        this.cancelledJobIds.delete(event.jobId);
       }
 
       this.latestJobEvents.delete(event.jobId);
@@ -943,6 +1291,184 @@ export class AppComponent implements OnInit, OnDestroy {
       this.infoMessage = null;
       void this.scanDownloads();
     }
+
+    if (this.selectedPackage) {
+      this.updatePackageDownloadSummary(this.selectedPackage.id);
+    }
+  }
+
+  private applyPausedStatusToJobFiles(jobId: string): void {
+    const fileIds = this.jobFileIds.get(jobId);
+    if (!fileIds) {
+      return;
+    }
+
+    this.files = this.files.map((file) => fileIds.has(file.package_file_id) && !this.isFileDownloadComplete(file)
+      ? { ...file, downloadStatus: 'paused' }
+      : file);
+  }
+
+  private applyCurrentJobStateToFiles(jobId: string): void {
+    const job = this.latestJobEvents.get(jobId);
+    if (!job) {
+      return;
+    }
+
+    if (this.pausedJobIds.has(jobId) || job.status === 'paused') {
+      this.applyPausedStatusToJobFiles(jobId);
+      return;
+    }
+
+    if (this.cancelledJobIds.has(jobId) || job.status === 'cancelled') {
+      this.clearJobFilesForCancel(jobId);
+      this.jobFileIds.delete(jobId);
+      this.jobDownloadTargets.delete(jobId);
+    }
+  }
+
+  private clearJobFilesForCancel(jobId: string): void {
+    const fileIds = this.jobFileIds.get(jobId);
+    if (!fileIds) {
+      return;
+    }
+
+    this.files = this.files.map((file) => fileIds.has(file.package_file_id) && !this.isFileDownloadComplete(file)
+      ? {
+          ...file,
+          downloadStatus: null,
+          receivedBytes: 0,
+          totalBytes: file.file_size,
+          errorMessage: null
+        }
+      : file);
+  }
+
+  private formatDownloadActionMessage(action: 'Pause' | 'Cancel', jobId: string): string {
+    const target = this.jobDownloadTargets.get(jobId);
+    const job = this.latestJobEvents.get(jobId);
+    const packageName = target?.packageName || job?.packageName || 'selected package';
+
+    if (!target || target.isPackage) {
+      return `${action} downloading Package ${packageName}`;
+    }
+
+    if (target.fileNames.length === 1) {
+      return `${action} downloading file ${target.fileNames[0]}`;
+    }
+
+    const listedNames = target.fileNames.slice(0, 5).join(', ');
+    const remainingCount = target.fileNames.length - 5;
+    return `${action} downloading files ${listedNames}${remainingCount > 0 ? ` and ${remainingCount} more` : ''}`;
+  }
+
+  private markJobRowStatus(jobId: string, status: DownloadEvent['status']): void {
+    const previous = this.latestJobEvents.get(jobId);
+    if (!previous) {
+      return;
+    }
+
+    this.latestJobEvents.set(jobId, {
+      ...previous,
+      status,
+      isPaused: status === 'paused'
+    });
+    this.syncJobRows();
+  }
+
+  private updateJobRow(event: DownloadEvent): void {
+    const previous = this.latestJobEvents.get(event.jobId);
+
+    if (event.packageFileId === undefined) {
+      this.latestJobEvents.set(event.jobId, {
+        ...previous,
+        ...event
+      });
+      return;
+    }
+
+    let status = previous?.status ?? event.status;
+    let message = previous?.message ?? event.message;
+
+    if (this.cancelledJobIds.has(event.jobId)) {
+      status = 'cancelled';
+      message = previous?.message ?? 'Download cancelled.';
+    } else if (this.pausedJobIds.has(event.jobId)) {
+      status = 'paused';
+    } else if (this.isActiveDownloadStatus(event.status) || event.status === 'error' || event.status === 'cancelled') {
+      status = event.status;
+      message = event.message ?? previous?.message;
+    } else if (!previous || previous.status === 'queued') {
+      status = 'downloading';
+    }
+
+    this.latestJobEvents.set(event.jobId, {
+      jobId: event.jobId,
+      packageId: event.packageId,
+      packageName: event.packageName,
+      status,
+      isPaused: this.pausedJobIds.has(event.jobId),
+      message
+    });
+  }
+
+  private handleAuthCancelled(_payload: AuthCancelledPayload): void {
+    if (this.authState.authenticated) {
+      return;
+    }
+
+    this.loadingAuth = false;
+    this.initialPackageLoad = false;
+    this.completingSessionId = null;
+    this.clearMessages();
+    this.changeDetector.detectChanges();
+  }
+
+  private applyJobEventToFiles(event: DownloadEvent): void {
+    const fileIds = this.jobFileIds.get(event.jobId);
+    if (!fileIds) {
+      return;
+    }
+
+    if (event.status === 'paused') {
+      this.files = this.files.map((file) => fileIds.has(file.package_file_id) && !this.isFileDownloadComplete(file)
+        ? { ...file, downloadStatus: 'paused' }
+        : file);
+      return;
+    }
+
+    if (event.status === 'downloading' && event.isPaused === false) {
+      this.files = this.files.map((file) => fileIds.has(file.package_file_id) && file.downloadStatus === 'paused'
+        ? { ...file, downloadStatus: 'queued' }
+        : file);
+      return;
+    }
+
+    if (event.status === 'cancelled') {
+      this.files = this.files.map((file) => fileIds.has(file.package_file_id) && !this.isFileDownloadComplete(file)
+        ? {
+            ...file,
+            downloadStatus: null,
+            receivedBytes: 0,
+            totalBytes: file.file_size,
+            errorMessage: null
+          }
+        : file);
+      return;
+    }
+
+    if (event.status === 'error') {
+      this.files = this.files.map((file) => fileIds.has(file.package_file_id) && !this.isFileDownloadComplete(file)
+        ? {
+            ...file,
+            downloadStatus: 'error',
+            errorMessage: event.message || 'Download failed.'
+          }
+        : file);
+    }
+  }
+
+  private isActiveDownloadStatus(status: DownloadEvent['status']): boolean {
+    return status === 'queued' || status === 'fetching-token' || status === 'downloading';
   }
 
   private syncJobRows(): void {
@@ -952,10 +1478,58 @@ export class AppComponent implements OnInit, OnDestroy {
       .slice(0, 8);
   }
 
+  private activeDownloadJob(): DownloadEvent | null {
+    return this.jobRows.find((job) => !this.isTerminalJob(job)) ?? null;
+  }
+
+  private updatePackageDownloadSummary(packageId: number): void {
+    this.packageDownloadSummaries.set(packageId, {
+      fileCount: this.files.length,
+      downloadableCount: this.files.filter((file) => this.canSelectFileForDownload(file)).length,
+      allFilesDownloaded: this.files.length > 0 && this.files.every((file) => this.isFileDownloadComplete(file))
+    });
+  }
+
   private clearMessages(): void {
     this.errorMessage = null;
     this.infoMessage = null;
   }
+
+  private updatePackagePaneWidth(clientX: number): void {
+    if (!this.paneResizeBounds) {
+      return;
+    }
+
+    this.setPackagePaneWidth(clientX - this.paneResizeBounds.left, this.paneResizeBounds.maxWidth);
+  }
+
+  private maxPackagePaneWidth(grid: HTMLElement): number {
+    return Math.max(
+      MIN_PACKAGE_PANE_WIDTH,
+      grid.getBoundingClientRect().width - MIN_FILE_PANE_WIDTH - PANE_RESIZER_WIDTH
+    );
+  }
+
+  private setPackagePaneWidth(width: number, maxWidth: number): void {
+    this.packagePaneWidth = clampPackagePaneWidth(width, maxWidth);
+    window.localStorage.setItem(PACKAGE_PANE_WIDTH_STORAGE_KEY, String(this.packagePaneWidth));
+    this.changeDetector.detectChanges();
+  }
+}
+
+function readStoredPackagePaneWidth(): number {
+  const storedWidth = Number(window.localStorage.getItem(PACKAGE_PANE_WIDTH_STORAGE_KEY));
+  return Number.isFinite(storedWidth)
+    ? clampPackagePaneWidth(storedWidth)
+    : DEFAULT_PACKAGE_PANE_WIDTH;
+}
+
+function clampPackagePaneWidth(width: number, maxWidth = Number.POSITIVE_INFINITY): number {
+  return Math.round(Math.min(Math.max(width, MIN_PACKAGE_PANE_WIDTH), maxWidth));
+}
+
+function nextSortDirection(direction: NameSortDirection): NameSortDirection {
+  return direction === 'asc' ? 'desc' : 'asc';
 }
 
 function normalizeMyPackage(item: MyPackageDto): UiPackage {
@@ -1046,19 +1620,19 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string)
 
 function errorMessage(error: unknown): string {
   if (error instanceof Error && error.message) {
-    return error.message;
+    return cleanErrorMessage(error.message);
   }
 
   if (typeof error === 'string' && error.trim()) {
-    return error.trim();
+    return cleanErrorMessage(error);
   }
 
   if (error && typeof error === 'object') {
     const record = error as Record<string, unknown>;
-    const directMessage = stringValue(record['message']);
-    const nestedMessage = stringValue(record['error'])
-      || stringValue((record['error'] as Record<string, unknown> | null)?.['message'])
-      || stringValue((record['error'] as Record<string, unknown> | null)?.['errorMessage']);
+    const directMessage = cleanStringValue(record['message']);
+    const nestedMessage = cleanStringValue(record['error'])
+      || cleanStringValue((record['error'] as Record<string, unknown> | null)?.['message'])
+      || cleanStringValue((record['error'] as Record<string, unknown> | null)?.['errorMessage']);
 
     if (directMessage && nestedMessage && directMessage !== nestedMessage) {
       return `${directMessage}: ${nestedMessage}`;
@@ -1080,6 +1654,26 @@ function errorMessage(error: unknown): string {
   }
 
   return 'An unexpected error occurred.';
+}
+
+function cleanStringValue(value: unknown): string | null {
+  const message = stringValue(value);
+  return message ? cleanErrorMessage(message) : null;
+}
+
+function cleanErrorMessage(message: string): string {
+  return message
+    .replace(/^Error invoking remote method '[^']+':\s*(?:Error:\s*)?/, '')
+    .trim();
+}
+
+function isAbortMessage(message: string | null | undefined): boolean {
+  if (!message) {
+    return false;
+  }
+
+  const normalized = message.toLowerCase();
+  return normalized.includes('abort') || normalized.includes('cancel');
 }
 
 function stringValue(value: unknown): string | null {

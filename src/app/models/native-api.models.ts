@@ -67,6 +67,10 @@ export interface AuthCallbackPayload {
   sessionId: string;
 }
 
+export interface AuthCancelledPayload {
+  message: string;
+}
+
 export interface AuthCompleteRequest {
   host: string;
   sessionId: string;
@@ -105,6 +109,7 @@ export interface HelpResponse {
 
 export interface NdaDesktopBridge {
   openAuthUrl(url: string): Promise<void>;
+  openExternalUrl(url: string): Promise<void>;
   getPendingAuthCallback(): Promise<AuthCallbackPayload | null>;
   completeSignIn(request: AuthCompleteRequest): Promise<AuthCompleteResponse>;
   verifySession(request: AuthVerifySessionRequest): Promise<AuthVerifySessionResponse>;
@@ -120,6 +125,7 @@ export interface NdaDesktopBridge {
   cancelDownloadJob(jobId: string): Promise<void>;
   sendHelpRequest(request: HelpRequest): Promise<HelpResponse>;
   onAuthCallback(callback: (payload: AuthCallbackPayload) => void): () => void;
+  onAuthCancelled(callback: (payload: AuthCancelledPayload) => void): () => void;
   onDownloadEvent(callback: (event: DownloadEvent) => void): () => void;
 }
 

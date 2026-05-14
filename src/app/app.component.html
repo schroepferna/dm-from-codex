@@ -1,24 +1,42 @@
 <header class="topbar">
   <div class="brand">
-    <img class="brand-icon" src="ndaicon.png" alt="" aria-hidden="true">
     <div class="brand-copy">
-      <span>NIMH Data Archive</span>
-      <h1>Download Manager</h1>
+      <h1>NDA Download Manager</h1>
     </div>
-    <span class="runtime desktop">Desktop</span>
   </div>
 
   <div class="top-actions">
-    <button class="secondary" type="button" (click)="openHelp()">Help</button>
-    <button *ngIf="authState.authenticated" class="secondary" type="button" (click)="signOut()">Sign out</button>
+    <button *ngIf="!authState.authenticated" class="secondary" type="button" (click)="openHelp()">Help</button>
+    <details #userMenu class="user-menu" *ngIf="authState.authenticated">
+      <summary>{{ authState.username || 'Account' }}</summary>
+      <div class="user-menu-panel">
+        <button class="secondary" type="button" (click)="userMenu.open = false; chooseDownloadDirectory()">Select Download Directory</button>
+        <button class="secondary" type="button" (click)="userMenu.open = false; openHelp()">Help</button>
+        <button class="secondary" type="button" (click)="userMenu.open = false; signOut()">Sign out</button>
+      </div>
+    </details>
   </div>
 </header>
 
 <main class="loading-screen" *ngIf="(loadingAuth && !authState.authenticated) || (authState.authenticated && initialPackageLoad)">
-  <section class="loading-panel" aria-live="polite">
-    <span class="eyebrow">{{ authState.authenticated ? 'Signed in' : 'RAS authentication' }}</span>
-    <h2>{{ authState.authenticated ? 'Fetching packages, this could take a few minutes' : 'Completing sign-in' }}</h2>
-    <p>{{ authState.authenticated ? 'Loading your NDA packages and files.' : 'Finishing RAS authentication.' }}</p>
+  <section class="loading-panel" [class.sign-in-loading]="!authState.authenticated" [class.package-loading]="authState.authenticated" aria-live="polite">
+    <ng-container *ngIf="!authState.authenticated; else packageLoading">
+      <span class="loading-dots" aria-hidden="true">
+        <span></span>
+        <span></span>
+        <span></span>
+      </span>
+      <h2>Completing RAS sign in...</h2>
+    </ng-container>
+
+    <ng-template #packageLoading>
+      <span class="loading-dots" aria-hidden="true">
+        <span></span>
+        <span></span>
+        <span></span>
+      </span>
+      <h2>Loading your NDA packages...</h2>
+    </ng-template>
   </section>
 
   <div class="message error" *ngIf="errorMessage">{{ errorMessage }}</div>
@@ -26,30 +44,44 @@
 
   <main class="sign-in-screen" *ngIf="!authState.authenticated && !loadingAuth">
     <section class="sign-in-panel" aria-label="Sign in">
-      <img class="sign-in-icon" src="ndaicon.png" alt="" aria-hidden="true">
+      <img class="sign-in-logo" src="ndaicon.png" alt="NDA">
+      <div class="sign-in-copy">
+        <h2>Welcome to NIMH Data Archive</h2>
+        <p>
+          Please sign in using one of the three
+          <a class="ras-link" href="https://nda.nih.gov/nda/ras-news" (click)="openRasNews($event)">NIH Research Auth Service (RAS)</a>
+          identities to log into NDA
+        </p>
+      </div>
+      <div class="identity-options" aria-label="RAS identities">
+        <img class="identity-logo era-logo" src="era.png" alt="eRA">
+        <img class="identity-logo login-gov-logo" src="login-gov.png" alt="Login.gov">
+        <img class="identity-logo nih-piv-logo" src="nih-piv.png" alt="NIH PIV">
+      </div>
       <button class="primary" type="button" [disabled]="loadingAuth" (click)="startSignIn()">
         {{ loadingAuth ? 'Signing in' : 'Sign in with RAS' }}
       </button>
+      <p class="ras-identities-note">If you don't have one of the three RAS identities:</p>
+      <button class="secondary login-gov-button" type="button" (click)="openLoginGovCreateAccount()">
+        CREATE A LOGIN.GOV ACCOUNT
+      </button>
     </section>
 
-  <div class="message error" *ngIf="errorMessage">{{ errorMessage }}</div>
-  <div class="message info" *ngIf="infoMessage">{{ infoMessage }}</div>
+    <div class="message error" *ngIf="errorMessage">{{ errorMessage }}</div>
+    <div class="message info" *ngIf="infoMessage">{{ infoMessage }}</div>
+
+    <footer class="sign-in-warning" aria-label="Warning notice">
+      Warning Notice This is a U.S. Government computer system, which may be accessed and used only for authorized Government business by authorized personnel. Unauthorized access or use of this computer system may subject violators to criminal, civil, and/or administrative action. All information on this computer system may be intercepted, recorded, read, copied, and disclosed by and to authorized personnel for official purposes, including criminal investigations. Such information includes sensitive data encrypted to comply with confidentiality and privacy requirements. Access or use of this computer system by any person, whether authorized or unauthorized, constitutes consent to these terms. There is no right of privacy in this system.
+    </footer>
 </main>
 
 <main class="workspace" *ngIf="authState.authenticated && !initialPackageLoad">
-  <section class="session-band signed-in">
-    <div>
-      <span class="eyebrow">Signed in</span>
-      <strong>{{ authState.username }}</strong>
-      <span *ngIf="authState.lastVerifiedAt">Verified {{ formatDate(authState.lastVerifiedAt) }}</span>
-    </div>
-
+  <section class="status-band" [class.error]="errorMessage" [class.info]="!errorMessage && infoMessage" aria-live="polite">
+    <span class="eyebrow">{{ errorMessage ? 'Error' : 'Information' }}</span>
+    <strong>{{ errorMessage || infoMessage || 'Ready.' }}</strong>
   </section>
 
-  <div class="message error" *ngIf="errorMessage">{{ errorMessage }}</div>
-  <div class="message info" *ngIf="infoMessage">{{ infoMessage }}</div>
-
-  <section class="content-grid">
+  <section #contentGrid class="content-grid" [style.grid-template-columns]="paneGridColumns">
     <aside class="package-pane">
       <div class="tabs" role="tablist">
         <button type="button" [class.active]="activeTab === 'mine'" (click)="activeTab = 'mine'">My Packages</button>
@@ -57,23 +89,73 @@
       </div>
 
       <div class="package-list" *ngIf="activeTab === 'mine'">
+        <div class="package-list-toolbar">
+          <button
+            class="sort-toggle"
+            [class.desc]="myPackageNameSortDirection === 'desc'"
+            type="button"
+            [attr.aria-label]="packageNameSortAriaLabel('mine')"
+            title="Sort package names"
+            (click)="togglePackageNameSort('mine')"
+          >
+            <span class="sort-value">{{ packageNameSortLabel('mine') }}</span>
+            <svg class="sort-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+              <path d="M8 3v10"></path>
+              <path d="m4.5 9.5 3.5 3.5 3.5-3.5"></path>
+            </svg>
+          </button>
+        </div>
+
         <div class="empty-state" *ngIf="!loadingPackages && myPackages.length === 0">
           No packages.
         </div>
 
-        <button
-          class="package-row"
-          type="button"
+        <div
+          class="package-row mine"
           *ngFor="let pkg of myPackages; trackBy: trackPackage"
           [class.selected]="selectedPackage?.id === pkg.id"
-          (click)="selectPackage(pkg)"
         >
-          <span class="package-title">{{ pkg.name }}</span>
-          <span class="package-meta">{{ formatBytes(pkg.fileSize) }}</span>
-        </button>
+          <button class="package-select" type="button" (click)="selectPackage(pkg)">
+            <span class="package-title">{{ pkg.name }}</span>
+            <span class="package-meta">{{ formatBytes(pkg.fileSize) }}</span>
+          </button>
+          <button
+            class="package-action package-download"
+            [class.package-show]="packageActionLabel(pkg) === 'Show'"
+            type="button"
+            [disabled]="isPackageActionDisabled(pkg)"
+            [attr.aria-label]="packageActionLabel(pkg) + ' ' + pkg.name"
+            [title]="packageActionLabel(pkg) + ' package'"
+            (click)="$event.stopPropagation(); runPackageAction(pkg)"
+          >
+            <svg *ngIf="packageActionLabel(pkg) === 'Download'" class="download-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+              <path d="M10 3v8"></path>
+              <path d="m6.5 7.5 3.5 3.5 3.5-3.5"></path>
+              <path d="M4.5 14.5h11"></path>
+            </svg>
+            <span *ngIf="packageActionLabel(pkg) === 'Show'">Show</span>
+          </button>
+        </div>
       </div>
 
       <div class="package-list" *ngIf="activeTab === 'shared'">
+        <div class="package-list-toolbar">
+          <button
+            class="sort-toggle"
+            [class.desc]="sharedPackageNameSortDirection === 'desc'"
+            type="button"
+            [attr.aria-label]="packageNameSortAriaLabel('shared')"
+            title="Sort package names"
+            (click)="togglePackageNameSort('shared')"
+          >
+            <span class="sort-value">{{ packageNameSortLabel('shared') }}</span>
+            <svg class="sort-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+              <path d="M8 3v10"></path>
+              <path d="m4.5 9.5 3.5 3.5 3.5-3.5"></path>
+            </svg>
+          </button>
+        </div>
+
         <div class="empty-state" *ngIf="!loadingPackages && sharedPackages.length === 0">
           No shared packages.
         </div>
@@ -95,6 +177,17 @@
       </div>
     </aside>
 
+    <div
+      class="pane-resizer"
+      role="separator"
+      aria-label="Resize package and file panes"
+      aria-orientation="vertical"
+      [attr.aria-valuenow]="packagePaneWidth"
+      tabindex="0"
+      (pointerdown)="startPaneResize($event, contentGrid)"
+      (keydown)="resizePaneWithKeyboard($event, contentGrid)"
+    ></div>
+
     <section class="file-pane">
       <div class="file-header">
         <div>
@@ -102,11 +195,10 @@
         </div>
 
         <div class="file-actions">
-          <button class="secondary" type="button" (click)="chooseDownloadDirectory()">Directory</button>
-          <button class="secondary" type="button" [disabled]="!downloadDirectory || scanning" (click)="scanDownloads()">Scan</button>
-          <button class="secondary" type="button" *ngIf="selectedPackage" [disabled]="!canShowPackageDownload() || scanning" (click)="showPackageInFolder()">Show Package</button>
-          <button class="primary" type="button" [disabled]="downloadInProgress || downloadableFileCount === 0" (click)="downloadPackage()">Download Package</button>
+          <button class="secondary" type="button" [disabled]="!downloadDirectory || scanning" (click)="scanDownloads()">Scan Download Directory</button>
           <button class="primary subtle" type="button" [disabled]="downloadInProgress || selectedFileCount === 0" (click)="downloadSelected()">Download Selected</button>
+          <button class="secondary" type="button" [disabled]="!canPauseActiveDownload()" (click)="togglePauseActiveDownload()">{{ activeDownloadPaused ? 'Resume Download' : 'Pause Download' }}</button>
+          <button class="secondary danger" type="button" [disabled]="!canCancelActiveDownload()" (click)="cancelActiveDownload()">Cancel Download</button>
         </div>
       </div>
 
@@ -114,19 +206,6 @@
         <span>Directory</span>
         <strong>{{ downloadDirectory || 'Not selected' }}</strong>
         <span>{{ selectedFileCount }} selected, {{ formatBytes(selectedFilesSize) }}</span>
-      </div>
-
-      <div class="jobs" *ngIf="jobRows.length > 0">
-        <div class="job-row" *ngFor="let job of jobRows" [class.error]="job.status === 'error'">
-          <span>{{ job.packageName }}</span>
-          <strong>{{ jobStatusLabel(job) }}</strong>
-          <span>{{ job.message || job.downloadAlias || '' }}</span>
-          <div class="job-actions">
-            <button *ngIf="canPauseJob(job)" class="link-button" type="button" (click)="pauseJob(job.jobId)">Pause</button>
-            <button *ngIf="canResumeJob(job)" class="link-button" type="button" (click)="resumeJob(job.jobId)">Resume</button>
-            <button *ngIf="canCancelJob(job)" class="link-button" type="button" (click)="cancelJob(job.jobId)">Cancel</button>
-          </div>
-        </div>
       </div>
 
       <div class="empty-state" *ngIf="!selectedPackage">
@@ -140,7 +219,23 @@
               <th class="select-col">
                 <input type="checkbox" [checked]="allFilesSelected" [disabled]="downloadableFileCount === 0" (change)="toggleAllFiles()" aria-label="Select all files">
               </th>
-              <th>File</th>
+              <th>
+                <button
+                  class="file-sort-button"
+                  [class.desc]="fileNameSortDirection === 'desc'"
+                  type="button"
+                  [attr.aria-label]="fileNameSortAriaLabel()"
+                  title="Sort file names"
+                  (click)="toggleFileNameSort()"
+                >
+                  <span>File</span>
+                  <span class="sort-value">{{ fileNameSortLabel() }}</span>
+                  <svg class="sort-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+                    <path d="M8 3v10"></path>
+                    <path d="m4.5 9.5 3.5 3.5 3.5-3.5"></path>
+                  </svg>
+                </button>
+              </th>
               <th>Size</th>
               <th>Created</th>
               <th>Local</th>
@@ -149,7 +244,7 @@
             </tr>
           </thead>
           <tbody>
-            <tr *ngIf="loadingFiles">
+            <tr *ngIf="loadingFiles && files.length === 0">
               <td colspan="7" class="loading-cell">Loading files</td>
             </tr>
             <tr *ngFor="let file of files; trackBy: trackFile">
