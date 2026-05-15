@@ -49,17 +49,6 @@ export interface PackageFilesResponse {
   results: PackageFileDto[];
 }
 
-export interface DownloadTokenResponse {
-  package_file_id: number;
-  download_alias: string;
-  access_key: string;
-  secret_key: string;
-  session_token: string;
-  expiration_date: string;
-  destination_uri: string | null;
-  source_uri: string;
-}
-
 export interface AuthState {
   host: string;
   sessionId: string | null;

@@ -2,16 +2,14 @@ import { app, BrowserWindow, dialog, ipcMain, net, shell, WebContents } from 'el
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import { mkdir, open, readFile, rename, rm, stat, statfs, writeFile } from 'node:fs/promises';
-import https from 'node:https';
 import path from 'node:path';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import { GetObjectCommand, HeadObjectCommand, S3Client } from '@aws-sdk/client-s3';
 
 const PROTOCOL = 'nda-dm';
-const DEFAULT_AWS_REGION = process.env['NDA_DM_AWS_REGION'] || 'us-east-1';
 const DEFAULT_FILE_CONCURRENCY = 2;
-const DEFAULT_TOKEN_CONCURRENCY = 8;
+const DEFAULT_URL_BATCH_CONCURRENCY = 4;
+const BATCH_PRESIGNED_URL_LIMIT = 50;
 const DEFAULT_CHUNK_CONCURRENCY = 4;
 const CHUNK_SIZE_BYTES = 64 * 1024 * 1024;
 const PART_MANIFEST_VERSION = 1;
@@ -63,15 +61,14 @@ interface DownloadStartRequest {
   chunkConcurrency?: number;
 }
 
-interface DownloadTokenResponse {
+interface PresignedDownloadUrlResponse {
   package_file_id: number;
-  download_alias: string;
-  access_key: string;
-  secret_key: string;
-  session_token: string;
-  expiration_date: string;
-  destination_uri: string | null;
-  source_uri: string;
+  downloadURL: string;
+}
+
+interface DirectDownloadSource {
+  sourceHost: string;
+  sourcePath: string;
 }
 
 interface DownloadEvent {
@@ -97,11 +94,11 @@ interface DownloadJob {
   paused: boolean;
   pauseWaiters: Array<() => void>;
   activeFiles: Map<number, NativeFileInput>;
-  downloadTokens: Map<number, Promise<DownloadTokenResult>>;
+  downloadUrls: Map<number, Promise<DownloadUrlResult>>;
 }
 
-type DownloadTokenResult =
-  | { ok: true; token: DownloadTokenResponse }
+type DownloadUrlResult =
+  | { ok: true; url: PresignedDownloadUrlResponse }
   | { ok: false; error: unknown };
 
 interface Deferred<T> {
@@ -121,8 +118,8 @@ interface PartManifest {
   downloadAlias: string;
   fileSize: number;
   chunkSize: number;
-  bucket: string;
-  key: string;
+  sourceHost: string;
+  sourcePath: string;
   completedChunks: number[];
   updatedAt: string;
 }
@@ -557,7 +554,7 @@ function registerIpcHandlers(): void {
       paused: false,
       pauseWaiters: [],
       activeFiles: new Map(),
-      downloadTokens: new Map()
+      downloadUrls: new Map()
     };
 
     jobs.set(job.id, job);
@@ -777,7 +774,7 @@ async function runDownloadJob(job: DownloadJob): Promise<void> {
   const {
     files,
     fileConcurrency = DEFAULT_FILE_CONCURRENCY,
-    tokenConcurrency = DEFAULT_TOKEN_CONCURRENCY
+    tokenConcurrency = DEFAULT_URL_BATCH_CONCURRENCY
   } = job.request;
 
   try {
@@ -806,10 +803,10 @@ async function runDownloadJob(job: DownloadJob): Promise<void> {
 
     sendDownloadEvent(job, {
       status: 'fetching-token',
-      message: `Preparing download tokens for ${filesToDownload.length} file${filesToDownload.length === 1 ? '' : 's'}.`
+      message: `Preparing download URLs for ${filesToDownload.length} file${filesToDownload.length === 1 ? '' : 's'}.`
     });
     startDownloadHeartbeat(job);
-    const tokenPrefetch = prefetchDownloadTokens(job, filesToDownload, clamp(tokenConcurrency, 1, 12));
+    const urlPrefetch = prefetchDownloadUrls(job, filesToDownload, clamp(tokenConcurrency, 1, 8));
 
     await runLimited(filesToDownload, clamp(fileConcurrency, 1, 6), async (file) => {
       await waitForResume(job);
@@ -820,7 +817,7 @@ async function runDownloadJob(job: DownloadJob): Promise<void> {
 
       await downloadOneFile(job, file);
     });
-    await tokenPrefetch;
+    await urlPrefetch;
 
     sendDownloadEvent(job, { status: 'job-complete', message: 'Download complete.' });
   } catch (error) {
@@ -834,7 +831,7 @@ async function runDownloadJob(job: DownloadJob): Promise<void> {
     job.paused = false;
     releasePauseWaiters(job);
     job.activeFiles.clear();
-    job.downloadTokens.clear();
+    job.downloadUrls.clear();
 
     if (job.heartbeatTimer) {
       clearInterval(job.heartbeatTimer);
@@ -868,21 +865,16 @@ async function prepareDownloadFiles(job: DownloadJob, files: NativeFileInput[]):
   return files.filter((file) => pendingFileIds.has(file.packageFileId));
 }
 
-async function prefetchDownloadTokens(job: DownloadJob, files: NativeFileInput[], concurrency: number): Promise<void> {
-  const deferredByFileId = new Map<number, Deferred<DownloadTokenResult>>();
+async function prefetchDownloadUrls(job: DownloadJob, files: NativeFileInput[], concurrency: number): Promise<void> {
+  const deferredByFileId = new Map<number, Deferred<DownloadUrlResult>>();
 
   for (const file of files) {
-    const deferred = createDeferred<DownloadTokenResult>();
+    const deferred = createDeferred<DownloadUrlResult>();
     deferredByFileId.set(file.packageFileId, deferred);
-    job.downloadTokens.set(file.packageFileId, deferred.promise);
+    job.downloadUrls.set(file.packageFileId, deferred.promise);
   }
 
-  await runLimited(files, concurrency, async (file) => {
-    const deferred = deferredByFileId.get(file.packageFileId);
-    if (!deferred) {
-      return;
-    }
-
+  await runLimited(chunkItems(files, BATCH_PRESIGNED_URL_LIMIT), concurrency, async (batch) => {
     try {
       await waitForResume(job);
 
@@ -890,26 +882,49 @@ async function prefetchDownloadTokens(job: DownloadJob, files: NativeFileInput[]
         throw new Error('Download cancelled.');
       }
 
-      const token = await fetchDownloadToken(job, file);
-      deferred.resolve({ ok: true, token });
+      const urls = await fetchBatchPresignedUrls(job, batch);
+      const urlByFileId = new Map(urls.map((url) => [url.package_file_id, url]));
+      for (const file of batch) {
+        const deferred = deferredByFileId.get(file.packageFileId);
+        const url = urlByFileId.get(file.packageFileId);
+        if (!deferred) {
+          continue;
+        }
+
+        if (url) {
+          deferred.resolve({ ok: true, url });
+        } else {
+          deferred.resolve({
+            ok: false,
+            error: new Error(`Presigned URL response did not include ${file.downloadAlias}.`)
+          });
+        }
+      }
     } catch (error) {
-      deferred.resolve({ ok: false, error });
+      for (const file of batch) {
+        deferredByFileId.get(file.packageFileId)?.resolve({ ok: false, error });
+      }
     }
   });
 }
 
-async function getDownloadToken(job: DownloadJob, file: NativeFileInput): Promise<DownloadTokenResponse> {
-  const prefetched = job.downloadTokens.get(file.packageFileId);
+async function getDownloadUrl(job: DownloadJob, file: NativeFileInput): Promise<PresignedDownloadUrlResponse> {
+  const prefetched = job.downloadUrls.get(file.packageFileId);
   if (!prefetched) {
-    return fetchDownloadToken(job, file);
+    const [url] = await fetchBatchPresignedUrls(job, [file]);
+    if (!url) {
+      throw new Error(`Presigned URL response did not include ${file.downloadAlias}.`);
+    }
+
+    return url;
   }
 
   const result = await prefetched;
   if (result.ok) {
-    return result.token;
+    return result.url;
   }
 
-  throw result.error instanceof Error ? result.error : new Error('Download token request failed.');
+  throw result.error instanceof Error ? result.error : new Error('Presigned URL request failed.');
 }
 
 function createDeferred<T>(): Deferred<T> {
@@ -919,6 +934,15 @@ function createDeferred<T>(): Deferred<T> {
   });
 
   return { promise, resolve };
+}
+
+function chunkItems<T>(items: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+
+  return chunks;
 }
 
 async function checkDownloadDiskSpace(job: DownloadJob, files: NativeFileInput[]): Promise<void> {
@@ -1110,32 +1134,19 @@ async function downloadOneFile(job: DownloadJob, file: NativeFileInput): Promise
       message: ''
     });
 
-    const downloadToken = await getDownloadToken(job, file);
+    const presignedUrl = await getDownloadUrl(job, file);
+    assertHttpUrl(presignedUrl.downloadURL);
     await waitForResume(job);
-    const s3Location = parseS3Uri(downloadToken.source_uri);
-    const client = new S3Client({
-      region: DEFAULT_AWS_REGION,
-      credentials: {
-        accessKeyId: downloadToken.access_key,
-        secretAccessKey: downloadToken.secret_key,
-        sessionToken: downloadToken.session_token
-      },
-      requestHandler: new (await import('@smithy/node-http-handler')).NodeHttpHandler({
-        httpsAgent: new https.Agent({
-          keepAlive: true,
-          maxSockets: Math.max(16, (job.request.chunkConcurrency || DEFAULT_CHUNK_CONCURRENCY) * 4)
-        })
-      })
-    });
+    const downloadSource = getDirectDownloadSource(presignedUrl.downloadURL);
 
     const totalBytes = file.fileSize > 0
       ? file.fileSize
-      : await fetchObjectSize(client, s3Location.bucket, s3Location.key, job.abortController.signal);
+      : await fetchPresignedDownloadSize(presignedUrl.downloadURL, file, job.abortController.signal);
 
     const tempPath = `${finalPath}.part`;
     await waitForResume(job);
     const partialState = totalBytes > 0
-      ? await preparePartialDownload(tempPath, file, totalBytes, s3Location.bucket, s3Location.key)
+      ? await preparePartialDownload(tempPath, file, totalBytes, downloadSource)
       : null;
 
     sendDownloadEvent(job, {
@@ -1153,7 +1164,7 @@ async function downloadOneFile(job: DownloadJob, file: NativeFileInput): Promise
       const handle = await open(tempPath, 'w');
       await handle.close();
     } else {
-      await downloadS3Object(job, client, s3Location.bucket, s3Location.key, tempPath, file, totalBytes, partialState);
+      await downloadPresignedUrlObject(job, presignedUrl.downloadURL, tempPath, file, totalBytes, partialState);
       await ensureFileSize(tempPath, totalBytes);
     }
 
@@ -1187,12 +1198,20 @@ async function downloadOneFile(job: DownloadJob, file: NativeFileInput): Promise
   }
 }
 
-async function fetchDownloadToken(job: DownloadJob, file: NativeFileInput): Promise<DownloadTokenResponse> {
-  let response = await requestDownloadToken(job, file);
+async function fetchBatchPresignedUrls(job: DownloadJob, batch: NativeFileInput[]): Promise<PresignedDownloadUrlResponse[]> {
+  if (batch.length === 0) {
+    return [];
+  }
+
+  if (batch.length > BATCH_PRESIGNED_URL_LIMIT) {
+    throw new Error(`Presigned URL batches cannot include more than ${BATCH_PRESIGNED_URL_LIMIT} files.`);
+  }
+
+  let response = await requestBatchPresignedUrls(job, batch);
   if (!response.ok && shouldRefreshAuthBeforeRetry(response.status)) {
     await refreshJobAuthToken(job);
     await verifySessionForJob(job);
-    response = await requestDownloadToken(job, file);
+    response = await requestBatchPresignedUrls(job, batch);
   }
 
   if (!response.ok) {
@@ -1200,33 +1219,36 @@ async function fetchDownloadToken(job: DownloadJob, file: NativeFileInput): Prom
     if (shouldRetryAfterSessionError(response.status, detail) && job.request.sessionId) {
       await refreshJobAuthToken(job);
       await verifySessionForJob(job);
-      const retry = await requestDownloadToken(job, file);
+      const retry = await requestBatchPresignedUrls(job, batch);
       if (retry.ok) {
         const retryPayload = await retry.json().catch(() => {
-          throw new Error(`Download token response for ${file.downloadAlias} was not valid JSON.`);
+          throw new Error(`Presigned URL response for package ${job.request.packageId} was not valid JSON.`);
         });
-        return normalizeDownloadTokenResponse(retryPayload, file);
+        return normalizeBatchPresignedUrlsResponse(retryPayload, batch);
       }
 
       const retryDetail = await retry.text().catch(() => '');
-      throw new Error(`Download token failed for ${file.downloadAlias}: HTTP ${retry.status}${retryDetail ? ` ${retryDetail}` : ''}`);
+      throw new Error(`Presigned URL request failed for package ${job.request.packageId}: HTTP ${retry.status}${retryDetail ? ` ${retryDetail}` : ''}`);
     }
 
-    throw new Error(`Download token failed for ${file.downloadAlias}: HTTP ${response.status}${detail ? ` ${detail}` : ''}`);
+    throw new Error(`Presigned URL request failed for package ${job.request.packageId}: HTTP ${response.status}${detail ? ` ${detail}` : ''}`);
   }
 
   const payload = await response.json().catch(() => {
-    throw new Error(`Download token response for ${file.downloadAlias} was not valid JSON.`);
+    throw new Error(`Presigned URL response for package ${job.request.packageId} was not valid JSON.`);
   });
-  return normalizeDownloadTokenResponse(payload, file);
+  return normalizeBatchPresignedUrlsResponse(payload, batch);
 }
 
-function requestDownloadToken(job: DownloadJob, file: NativeFileInput): Promise<Response> {
-  const url = `${trimTrailingSlash(job.request.host)}/api/package/${job.request.packageId}/files/${file.packageFileId}/download_token`;
+function requestBatchPresignedUrls(job: DownloadJob, batch: NativeFileInput[]): Promise<Response> {
+  const url = `${trimTrailingSlash(job.request.host)}/api/package/${job.request.packageId}/files/batchGeneratePresignedUrls`;
   return fetchWithTimeout(url, {
+    method: 'POST',
     headers: {
-      Authorization: `Bearer ${job.request.authToken}`
+      Authorization: `Bearer ${job.request.authToken}`,
+      'Content-Type': 'application/json'
     },
+    body: JSON.stringify(batch.map((file) => file.packageFileId)),
     signal: job.abortController.signal
   });
 }
@@ -1245,62 +1267,66 @@ function shouldRetryAfterSessionError(status: number, detail: string): boolean {
   );
 }
 
-function normalizeDownloadTokenResponse(payload: unknown, file: NativeFileInput): DownloadTokenResponse {
-  if (!payload || typeof payload !== 'object') {
-    throw new Error(`Download token response for ${file.downloadAlias} was empty or malformed.`);
+function normalizeBatchPresignedUrlsResponse(payload: unknown, batch: NativeFileInput[]): PresignedDownloadUrlResponse[] {
+  const values = Array.isArray(payload)
+    ? payload
+    : payload && typeof payload === 'object'
+      ? (payload as Record<string, unknown>)['presignedUrls']
+      : null;
+
+  if (!Array.isArray(values)) {
+    throw new Error(`Presigned URL response for package files ${batch.map((file) => file.packageFileId).join(', ')} was empty or malformed.`);
   }
 
-  const record = payload as Record<string, unknown>;
+  return values.map(normalizePresignedUrlResponse);
+}
+
+function normalizePresignedUrlResponse(value: unknown): PresignedDownloadUrlResponse {
+  if (!value || typeof value !== 'object') {
+    throw new Error('Presigned URL response item was empty or malformed.');
+  }
+
+  const record = value as Record<string, unknown>;
+  const packageFileId = readNumberFromKeys(record, ['package_file_id', 'packageFileId'], Number.NaN);
+  if (!Number.isFinite(packageFileId)) {
+    throw new Error('Presigned URL response item is missing package file id.');
+  }
+
+  const downloadURL = readStringFromKeys(record, ['downloadURL', 'downloadUrl', 'download_url'], '');
+  if (!downloadURL) {
+    throw new Error(`Presigned URL response for file ${packageFileId} is missing downloadURL.`);
+  }
+
+  assertHttpUrl(downloadURL);
   return {
-    package_file_id: readNumber(record, 'package_file_id', file.packageFileId),
-    download_alias: readString(record, 'download_alias', file.downloadAlias),
-    access_key: readRequiredString(record, 'access_key', 'access key', file),
-    secret_key: readRequiredString(record, 'secret_key', 'secret key', file),
-    session_token: readRequiredString(record, 'session_token', 'session token', file),
-    expiration_date: readString(record, 'expiration_date', ''),
-    destination_uri: readNullableString(record, 'destination_uri'),
-    source_uri: readRequiredString(record, 'source_uri', 'source uri', file)
+    package_file_id: packageFileId,
+    downloadURL
   };
 }
 
-function readRequiredString(
-  record: Record<string, unknown>,
-  key: string,
-  label: string,
-  file: NativeFileInput
-): string {
-  const value = readString(record, key, '');
-  if (!value) {
-    throw new Error(`Download token response for ${file.downloadAlias} is missing ${label}.`);
-  }
-
-  return value;
-}
-
-function readString(record: Record<string, unknown>, key: string, fallback: string): string {
-  const value = record[key];
-  if (typeof value === 'string') {
-    return value.trim();
+function readStringFromKeys(record: Record<string, unknown>, keys: string[], fallback: string): string {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'string' && value.trim()) {
+      return value.trim();
+    }
   }
 
   return fallback;
 }
 
-function readNullableString(record: Record<string, unknown>, key: string): string | null {
-  const value = readString(record, key, '');
-  return value || null;
-}
+function readNumberFromKeys(record: Record<string, unknown>, keys: string[], fallback: number): number {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return value;
+    }
 
-function readNumber(record: Record<string, unknown>, key: string, fallback: number): number {
-  const value = record[key];
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    return value;
-  }
-
-  if (typeof value === 'string') {
-    const parsed = Number(value);
-    if (Number.isFinite(parsed)) {
-      return parsed;
+    if (typeof value === 'string' && value.trim()) {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
     }
   }
 
@@ -1332,11 +1358,9 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string)
   });
 }
 
-async function downloadS3Object(
+async function downloadPresignedUrlObject(
   job: DownloadJob,
-  client: S3Client,
-  bucket: string,
-  key: string,
+  downloadUrl: string,
   tempPath: string,
   file: NativeFileInput,
   totalBytes: number,
@@ -1358,11 +1382,22 @@ async function downloadS3Object(
       throw new Error('Download cancelled.');
     }
 
-    const response = await client.send(new GetObjectCommand({
-      Bucket: bucket,
-      Key: key,
-      Range: `bytes=${chunk.start}-${chunk.end}`
-    }), { abortSignal: job.abortController.signal });
+    const response = await net.fetch(downloadUrl, {
+      method: 'GET',
+      headers: {
+        Range: `bytes=${chunk.start}-${chunk.end}`
+      },
+      signal: job.abortController.signal
+    });
+
+    if (!response.ok) {
+      throw new Error(`Download request failed for ${file.downloadAlias}: ${await responseStatusText(response)}`);
+    }
+
+    if (chunks.length > 1 && response.status !== 206) {
+      await cancelResponseBody(response);
+      throw new Error(`Download server did not honor range requests for ${file.downloadAlias}.`);
+    }
 
     const writeStream = fs.createWriteStream(tempPath, {
       flags: 'r+',
@@ -1372,7 +1407,7 @@ async function downloadS3Object(
     let receivedChunkBytes = 0;
 
     await pipeline(
-      toReadable(response.Body),
+      toReadable(response.body),
       createPauseGate(job, (buffer) => {
         receivedChunkBytes += buffer.length;
         emitProgress(buffer.length);
@@ -1390,8 +1425,7 @@ async function downloadS3Object(
       manifestWrite = manifestWrite.then(() => writePartManifest(partialState.manifestPath, createPartManifest(
         file,
         totalBytes,
-        bucket,
-        key,
+        getDirectDownloadSource(downloadUrl),
         completedChunks
       )));
       await manifestWrite;
@@ -1401,27 +1435,83 @@ async function downloadS3Object(
   await manifestWrite;
 }
 
-async function fetchObjectSize(client: S3Client, bucket: string, key: string, abortSignal: AbortSignal): Promise<number> {
-  const response = await client.send(new HeadObjectCommand({
-    Bucket: bucket,
-    Key: key
-  }), { abortSignal });
+async function fetchPresignedDownloadSize(downloadUrl: string, file: NativeFileInput, abortSignal: AbortSignal): Promise<number> {
+  const response = await net.fetch(downloadUrl, {
+    method: 'GET',
+    headers: {
+      Range: 'bytes=0-0'
+    },
+    signal: abortSignal
+  });
 
-  return response.ContentLength ?? 0;
+  if (response.status === 206) {
+    const totalBytes = parseContentRangeTotal(response.headers.get('content-range'));
+    await cancelResponseBody(response);
+    if (totalBytes !== null) {
+      return totalBytes;
+    }
+  } else if (response.status === 200) {
+    const contentLength = parseContentLength(response.headers.get('content-length'));
+    await cancelResponseBody(response);
+    if (contentLength !== null) {
+      return contentLength;
+    }
+  } else if (response.status === 416) {
+    const totalBytes = parseContentRangeTotal(response.headers.get('content-range'));
+    await cancelResponseBody(response);
+    if (totalBytes !== null) {
+      return totalBytes;
+    }
+  } else {
+    throw new Error(`Could not determine download size for ${file.downloadAlias}: ${await responseStatusText(response)}`);
+  }
+
+  throw new Error(`Could not determine download size for ${file.downloadAlias}.`);
+}
+
+async function responseStatusText(response: Response): Promise<string> {
+  const detail = await response.text().catch(() => '');
+  return `HTTP ${response.status}${detail ? ` ${detail}` : ''}`;
+}
+
+async function cancelResponseBody(response: Response): Promise<void> {
+  try {
+    await response.body?.cancel();
+  } catch {
+    // Best effort only; callers are already abandoning this response body.
+  }
+}
+
+function parseContentRangeTotal(value: string | null): number | null {
+  const match = value?.match(/\/(\d+)$/);
+  if (!match) {
+    return null;
+  }
+
+  const parsed = Number(match[1]);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function parseContentLength(value: string | null): number | null {
+  if (!value?.trim()) {
+    return null;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 async function preparePartialDownload(
   tempPath: string,
   file: NativeFileInput,
   totalBytes: number,
-  bucket: string,
-  key: string
+  source: DirectDownloadSource
 ): Promise<PartialDownloadState> {
   const manifestPath = getPartManifestPath(tempPath);
   const tempStat = await statIfExists(tempPath);
   const existingManifest = await readPartManifest(manifestPath);
 
-  if (tempStat && existingManifest && isPartManifestValid(existingManifest, file, totalBytes, bucket, key)) {
+  if (tempStat && existingManifest && isPartManifestValid(existingManifest, file, totalBytes, source)) {
     const completedChunks = normalizeCompletedChunks(existingManifest.completedChunks, totalBytes);
     if (tempStat.size >= completedHighWaterMark(completedChunks, totalBytes)) {
       if (tempStat.size > totalBytes) {
@@ -1440,7 +1530,7 @@ async function preparePartialDownload(
   await createEmptyFile(tempPath);
 
   const completedChunks = new Set<number>();
-  await writePartManifest(manifestPath, createPartManifest(file, totalBytes, bucket, key, completedChunks));
+  await writePartManifest(manifestPath, createPartManifest(file, totalBytes, source, completedChunks));
 
   return {
     manifestPath,
@@ -1550,8 +1640,8 @@ async function readPartManifest(manifestPath: string): Promise<PartManifest | nu
       typeof record.downloadAlias !== 'string' ||
       typeof record.fileSize !== 'number' ||
       typeof record.chunkSize !== 'number' ||
-      typeof record.bucket !== 'string' ||
-      typeof record.key !== 'string' ||
+      typeof record.sourceHost !== 'string' ||
+      typeof record.sourcePath !== 'string' ||
       !Array.isArray(record.completedChunks)
     ) {
       return null;
@@ -1563,8 +1653,8 @@ async function readPartManifest(manifestPath: string): Promise<PartManifest | nu
       downloadAlias: record.downloadAlias,
       fileSize: record.fileSize,
       chunkSize: record.chunkSize,
-      bucket: record.bucket,
-      key: record.key,
+      sourceHost: record.sourceHost,
+      sourcePath: record.sourcePath,
       completedChunks: record.completedChunks.filter((value): value is number => Number.isInteger(value)),
       updatedAt: typeof record.updatedAt === 'string' ? record.updatedAt : ''
     };
@@ -1582,8 +1672,7 @@ async function writePartManifest(manifestPath: string, manifest: PartManifest): 
 function createPartManifest(
   file: NativeFileInput,
   totalBytes: number,
-  bucket: string,
-  key: string,
+  source: DirectDownloadSource,
   completedChunks: Set<number>
 ): PartManifest {
   return {
@@ -1592,8 +1681,8 @@ function createPartManifest(
     downloadAlias: file.downloadAlias,
     fileSize: totalBytes,
     chunkSize: CHUNK_SIZE_BYTES,
-    bucket,
-    key,
+    sourceHost: source.sourceHost,
+    sourcePath: source.sourcePath,
     completedChunks: Array.from(completedChunks).sort((left, right) => left - right),
     updatedAt: new Date().toISOString()
   };
@@ -1603,12 +1692,11 @@ function isPartManifestValid(
   manifest: PartManifest,
   file: NativeFileInput,
   totalBytes: number,
-  bucket: string,
-  key: string
+  source: DirectDownloadSource
 ): boolean {
   return isPartManifestValidForFile(manifest, file, totalBytes)
-    && manifest.bucket === bucket
-    && manifest.key === key;
+    && manifest.sourceHost === source.sourceHost
+    && manifest.sourcePath === source.sourcePath;
 }
 
 function isPartManifestValidForFile(manifest: PartManifest, file: NativeFileInput, totalBytes: number): boolean {
@@ -1841,15 +1929,11 @@ async function statIfExists(filePath: string): Promise<fs.Stats | null> {
   }
 }
 
-function parseS3Uri(sourceUri: string): { bucket: string; key: string } {
-  const match = sourceUri.match(/^s3:\/\/([^/]+)\/(.+)$/);
-  if (!match) {
-    throw new Error(`Unsupported S3 URI: ${sourceUri}`);
-  }
-
+function getDirectDownloadSource(downloadUrl: string): DirectDownloadSource {
+  const parsed = new URL(downloadUrl);
   return {
-    bucket: match[1],
-    key: match[2]
+    sourceHost: parsed.hostname,
+    sourcePath: parsed.pathname
   };
 }
 
@@ -1889,7 +1973,11 @@ function toReadable(body: unknown): NodeJS.ReadableStream {
     return body as NodeJS.ReadableStream;
   }
 
-  throw new Error('S3 response did not include a readable body.');
+  if (body && typeof (body as { getReader?: unknown }).getReader === 'function') {
+    return Readable.fromWeb(body as Parameters<typeof Readable.fromWeb>[0]);
+  }
+
+  throw new Error('Download response did not include a readable body.');
 }
 
 function clamp(value: number, min: number, max: number): number {
