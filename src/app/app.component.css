@@ -766,21 +766,21 @@ header.topbar .user-menu-panel .secondary:hover {
 }
 
 .file-table th:nth-child(2) {
-  width: 34%;
+  width: 42%;
 }
 
 .file-table th:nth-child(3),
 .file-table th:nth-child(4),
 .file-table th:nth-child(5) {
-  width: 12%;
+  width: 11%;
 }
 
 .file-table th:nth-child(6) {
-  width: 16%;
+  width: 96px;
 }
 
 .file-table th:nth-child(7) {
-  width: 88px;
+  width: 68px;
 }
 
 .select-col {

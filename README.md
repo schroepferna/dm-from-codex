@@ -57,6 +57,8 @@ npm.cmd run start:revengers
 
 The local Angular URL is a development implementation detail. Use the Electron window for normal app testing.
 
+Runtime logs from local app runs are written under `logs/`, including Electron main-process and renderer console output in `logs/main.log`. Packaged builds use the app data directory's `logs` folder.
+
 ## Environment Configuration
 
 The API host and renderer Zendesk token are compiled from Angular environment files. There is no runtime environment selector in the UI.

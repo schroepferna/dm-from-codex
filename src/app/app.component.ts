@@ -4,45 +4,47 @@ import { FormsModule } from '@angular/forms';
 import { Subject, takeUntil } from 'rxjs';
 import {
   AuthState,
-  MyPackageDto,
-  SharedPackageDto,
   UiFile,
   UiPackage
 } from './models/package.models';
 import { AuthCancelledPayload, DownloadEvent, HelpAttachment, NativeFileInput } from './models/native-api.models';
+import {
+  DOWNLOAD_DIR_STORAGE_KEY,
+  HELP_EMAIL_PATTERN,
+  HELP_MAX_ATTACHMENTS,
+  HELP_SUBMIT_TIMEOUT_MS,
+  LOGIN_GOV_CREATE_ACCOUNT_URL,
+  MIN_FILE_PANE_WIDTH,
+  MIN_PACKAGE_PANE_WIDTH,
+  PACKAGE_PANE_WIDTH_STORAGE_KEY,
+  PANE_RESIZER_WIDTH,
+  RAS_NEWS_URL
+} from './app.constants';
+import { DownloadMode, DownloadTargetSummary, NameSortDirection, PackageDownloadSummary, PackageListSource } from './app.types';
+import { withTimeout } from './async.utils';
+import { formatDownloadStartMessage } from './download-message.utils';
+import { errorMessage, isAbortMessage } from './error.utils';
+import {
+  downloadIndicatorLabel,
+  formatBytes,
+  formatDate,
+  formatDateOnly,
+  isFileDownloadActive,
+  isFileDownloadComplete,
+  localStatusLabel,
+  progressPercent,
+  trackFile,
+  trackPackage
+} from './formatting.utils';
+import { toHelpAttachment } from './help-attachment.utils';
+import { normalizeMyPackage, normalizeSharedPackage, toNativeFile, validatePackageId } from './package-mappers';
+import { clampPackagePaneWidth, readStoredPackagePaneWidth } from './pane-resize.utils';
+import { nextSortDirection, sortFilesByName, sortPackagesByName } from './sort.utils';
 import { AuthService } from './services/auth.service';
 import { DownloadService } from './services/download.service';
 import { HelpService } from './services/help.service';
 import { NativeService } from './services/native.service';
 import { PackageService } from './services/package.service';
-
-const DOWNLOAD_DIR_STORAGE_KEY = 'nda-download-manager.downloadDir';
-const PACKAGE_PANE_WIDTH_STORAGE_KEY = 'nda-download-manager.packagePaneWidth';
-const DEFAULT_PACKAGE_PANE_WIDTH = 390;
-const MIN_PACKAGE_PANE_WIDTH = 280;
-const MIN_FILE_PANE_WIDTH = 480;
-const PANE_RESIZER_WIDTH = 18;
-const LOGIN_GOV_CREATE_ACCOUNT_URL = 'https://www.login.gov/create-an-account';
-const RAS_NEWS_URL = 'https://nda.nih.gov/nda/ras-news';
-const HELP_EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const HELP_SUBMIT_TIMEOUT_MS = 120000;
-const HELP_MAX_ATTACHMENTS = 5;
-const HELP_MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
-
-interface DownloadTargetSummary {
-  isPackage: boolean;
-  packageName: string;
-  fileNames: string[];
-}
-
-interface PackageDownloadSummary {
-  fileCount: number;
-  downloadableCount: number;
-  allFilesDownloaded: boolean;
-}
-
-type NameSortDirection = 'asc' | 'desc';
-type PackageListSource = 'mine' | 'shared';
 
 @Component({
   selector: 'nda-root',
@@ -56,6 +58,16 @@ type PackageListSource = 'mine' | 'shared';
 })
 export class AppComponent implements OnInit, OnDestroy {
   readonly isDesktop: boolean;
+  readonly downloadIndicatorLabel = downloadIndicatorLabel;
+  readonly formatBytes = formatBytes;
+  readonly formatDate = formatDate;
+  readonly formatDateOnly = formatDateOnly;
+  readonly isFileDownloadActive = isFileDownloadActive;
+  readonly isFileDownloadComplete = isFileDownloadComplete;
+  readonly localStatusLabel = localStatusLabel;
+  readonly progressPercent = progressPercent;
+  readonly trackFile = trackFile;
+  readonly trackPackage = trackPackage;
 
   authState: AuthState;
   activeTab: 'mine' | 'shared' = 'mine';
@@ -96,7 +108,6 @@ export class AppComponent implements OnInit, OnDestroy {
   private readonly jobFileIds = new Map<string, Set<number>>();
   private readonly jobDownloadTargets = new Map<string, DownloadTargetSummary>();
   private readonly packageDownloadSummaries = new Map<number, PackageDownloadSummary>();
-  private readonly nameCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
   private readonly pausedJobIds = new Set<string>();
   private readonly cancelledJobIds = new Set<string>();
   private completingSessionId: string | null = null;
@@ -909,7 +920,7 @@ export class AppComponent implements OnInit, OnDestroy {
     }
 
     try {
-      const attachments = await Promise.all(selectedFiles.map((file) => this.toHelpAttachment(file)));
+      const attachments = await Promise.all(selectedFiles.map((file) => toHelpAttachment(file)));
       this.helpAttachments = [...this.helpAttachments, ...attachments];
     } catch (error) {
       this.helpErrorMessage = errorMessage(error);
@@ -976,182 +987,19 @@ export class AppComponent implements OnInit, OnDestroy {
     }
   }
 
-  private async toHelpAttachment(file: File): Promise<HelpAttachment> {
-    if (file.size > HELP_MAX_ATTACHMENT_BYTES) {
-      throw new Error(`${file.name} is larger than ${this.formatBytes(HELP_MAX_ATTACHMENT_BYTES)}.`);
-    }
-
-    const dataBase64 = await fileToBase64(file);
-    return {
-      name: file.name,
-      mimeType: file.type || 'application/octet-stream',
-      size: file.size,
-      dataBase64
-    };
-  }
-
-  formatBytes(bytes: number | null | undefined): string {
-    if (bytes === null || bytes === undefined) {
-      return 'Unknown';
-    }
-
-    if (bytes === 0) {
-      return '0 B';
-    }
-
-    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    const exponent = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
-    const value = bytes / Math.pow(1024, exponent);
-    return `${value.toFixed(value >= 10 || exponent === 0 ? 0 : 1)} ${units[exponent]}`;
-  }
-
-  formatDate(value: string | null | undefined): string {
-    if (!value) {
-      return 'Unknown';
-    }
-
-    return new Intl.DateTimeFormat(undefined, {
-      year: 'numeric',
-      month: 'short',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit'
-    }).format(new Date(value));
-  }
-
-  formatDateOnly(value: string | null | undefined): string {
-    if (!value) {
-      return 'Unknown';
-    }
-
-    return new Intl.DateTimeFormat(undefined, {
-      year: 'numeric',
-      month: 'short',
-      day: '2-digit'
-    }).format(new Date(value));
-  }
-
-  localStatusLabel(file: UiFile): string {
-    if (file.downloadStatus === 'paused') {
-      return 'Paused';
-    }
-
-    if (file.downloadStatus === 'queued') {
-      return 'Queued';
-    }
-
-    if (file.downloadStatus === 'downloading') {
-      return 'Downloading...';
-    }
-
-    if (file.downloadStatus === 'fetching-token') {
-      return 'Preparing';
-    }
-
-    if (file.downloadStatus === 'complete' || file.downloadStatus === 'skipped') {
-      return 'Downloaded';
-    }
-
-    if (file.downloadStatus === 'error') {
-      return 'Failed';
-    }
-
-    switch (file.localStatus) {
-      case 'downloaded':
-        return 'Downloaded';
-      case 'partial':
-        return 'Partial';
-      case 'missing':
-        return 'Not downloaded';
-      default:
-        return 'Unknown';
-    }
-  }
-
-  isFileDownloadActive(file: UiFile): boolean {
-    return file.downloadStatus === 'queued'
-      || file.downloadStatus === 'fetching-token'
-      || file.downloadStatus === 'downloading';
-  }
-
-  isFileDownloadComplete(file: UiFile): boolean {
-    return file.downloadStatus === 'complete'
-      || file.downloadStatus === 'skipped'
-      || file.localStatus === 'downloaded';
-  }
-
-  downloadIndicatorLabel(file: UiFile): string {
-    if (this.isFileDownloadComplete(file)) {
-      return 'Download complete';
-    }
-
-    if (this.isFileDownloadActive(file)) {
-      return 'Download in progress';
-    }
-
-    return 'Not downloaded';
-  }
-
-  progressPercent(file: UiFile): number {
-    if (file.downloadStatus === 'complete' || file.downloadStatus === 'skipped' || file.localStatus === 'downloaded') {
-      return 100;
-    }
-
-    const total = file.totalBytes || file.file_size;
-    if (!file.receivedBytes || !total) {
-      return 0;
-    }
-
-    return Math.min(100, Math.round((file.receivedBytes / total) * 100));
-  }
-
-  trackPackage(_index: number, pkg: UiPackage): number {
-    return pkg.id;
-  }
-
-  trackFile(_index: number, file: UiFile): number {
-    return file.package_file_id;
-  }
-
   private setMyPackages(packages: UiPackage[]): void {
-    this.myPackages = this.sortPackagesByName(packages, this.myPackageNameSortDirection);
+    this.myPackages = sortPackagesByName(packages, this.myPackageNameSortDirection);
   }
 
   private setSharedPackages(packages: UiPackage[]): void {
-    this.sharedPackages = this.sortPackagesByName(packages, this.sharedPackageNameSortDirection);
+    this.sharedPackages = sortPackagesByName(packages, this.sharedPackageNameSortDirection);
   }
 
   private setFiles(files: UiFile[]): void {
-    this.files = this.sortFilesByName(files, this.fileNameSortDirection);
+    this.files = sortFilesByName(files, this.fileNameSortDirection);
   }
 
-  private sortPackagesByName(packages: UiPackage[], direction: NameSortDirection): UiPackage[] {
-    const multiplier = direction === 'asc' ? 1 : -1;
-
-    return [...packages].sort((left, right) => {
-      const nameCompare = this.nameCollator.compare(left.name, right.name);
-      if (nameCompare !== 0) {
-        return nameCompare * multiplier;
-      }
-
-      return left.id - right.id;
-    });
-  }
-
-  private sortFilesByName(files: UiFile[], direction: NameSortDirection): UiFile[] {
-    const multiplier = direction === 'asc' ? 1 : -1;
-
-    return [...files].sort((left, right) => {
-      const nameCompare = this.nameCollator.compare(left.download_alias, right.download_alias);
-      if (nameCompare !== 0) {
-        return nameCompare * multiplier;
-      }
-
-      return left.package_file_id - right.package_file_id;
-    });
-  }
-
-  private async startDownload(files: UiFile[], mode: 'package' | 'selection'): Promise<void> {
+  private async startDownload(files: UiFile[], mode: DownloadMode): Promise<void> {
     this.clearMessages();
     const filesToDownload = files.filter((file) => this.canSelectFileForDownload(file));
 
@@ -1296,7 +1144,12 @@ export class AppComponent implements OnInit, OnDestroy {
   private handleDownloadEvent(event: DownloadEvent): void {
     if (event.isPaused === true) {
       this.pausedJobIds.add(event.jobId);
-    } else if ((event.isPaused === false && event.packageFileId === undefined) || event.status === 'job-complete' || event.status === 'error' || event.status === 'cancelled') {
+    } else if (
+      (event.isPaused === false && event.packageFileId === undefined)
+      || event.status === 'job-complete'
+      || (event.status === 'error' && event.packageFileId === undefined)
+      || event.status === 'cancelled'
+    ) {
       this.pausedJobIds.delete(event.jobId);
     }
 
@@ -1339,7 +1192,7 @@ export class AppComponent implements OnInit, OnDestroy {
       });
     }
 
-    if (event.status === 'error') {
+    if (event.status === 'error' && event.packageFileId === undefined) {
       this.jobFileIds.delete(event.jobId);
       this.jobDownloadTargets.delete(event.jobId);
       this.cancelledJobIds.delete(event.jobId);
@@ -1491,9 +1344,12 @@ export class AppComponent implements OnInit, OnDestroy {
       message = previous?.message ?? 'Download cancelled.';
     } else if (this.pausedJobIds.has(event.jobId)) {
       status = 'paused';
-    } else if (this.isActiveDownloadStatus(event.status) || event.status === 'error' || event.status === 'cancelled') {
+    } else if (this.isActiveDownloadStatus(event.status) || event.status === 'cancelled') {
       status = event.status;
       message = event.message ?? previous?.message;
+    } else if (event.status === 'error') {
+      status = previous && !this.isTerminalJob(previous) ? previous.status : 'downloading';
+      message = previous?.message ?? event.message;
     } else if (!previous || previous.status === 'queued') {
       status = 'downloading';
     }
@@ -1612,187 +1468,4 @@ export class AppComponent implements OnInit, OnDestroy {
     window.localStorage.setItem(PACKAGE_PANE_WIDTH_STORAGE_KEY, String(this.packagePaneWidth));
     this.changeDetector.detectChanges();
   }
-}
-
-function readStoredPackagePaneWidth(): number {
-  const storedWidth = Number(window.localStorage.getItem(PACKAGE_PANE_WIDTH_STORAGE_KEY));
-  return Number.isFinite(storedWidth)
-    ? clampPackagePaneWidth(storedWidth)
-    : DEFAULT_PACKAGE_PANE_WIDTH;
-}
-
-function clampPackagePaneWidth(width: number, maxWidth = Number.POSITIVE_INFINITY): number {
-  return Math.round(Math.min(Math.max(width, MIN_PACKAGE_PANE_WIDTH), maxWidth));
-}
-
-function nextSortDirection(direction: NameSortDirection): NameSortDirection {
-  return direction === 'asc' ? 'desc' : 'asc';
-}
-
-function normalizeMyPackage(item: MyPackageDto): UiPackage {
-  const id = normalizeNumericId(item.package_id, 'package id');
-
-  return {
-    id,
-    name: item.description || `Package ${id}`,
-    description: item.source_package_description || item.description || '',
-    fileCount: item.file_count,
-    fileSize: item.total_package_size,
-    createdDate: item.created_date,
-    source: 'mine',
-    status: item.status,
-    raw: item
-  };
-}
-
-function normalizeSharedPackage(item: SharedPackageDto): UiPackage {
-  const id = normalizeNumericId(item.packageId, 'shared package id');
-
-  return {
-    id,
-    name: item.packageName,
-    description: item.packageDescription,
-    fileCount: item.fileCount,
-    fileSize: item.fileSize,
-    createdDate: item.createdDate,
-    source: 'shared',
-    raw: item
-  };
-}
-
-function normalizeNumericId(value: unknown, label: string): number {
-  const id = Number(value);
-  if (!Number.isFinite(id)) {
-    throw new Error(`Package response is missing ${label}.`);
-  }
-
-  return id;
-}
-
-function toNativeFile(file: UiFile): NativeFileInput {
-  const packageFileId = Number(file.package_file_id);
-  const fileSize = Number(file.file_size);
-
-  if (!Number.isFinite(packageFileId)) {
-    throw new Error(`File ${file.download_alias || 'selected file'} is missing a package file id.`);
-  }
-
-  if (!file.download_alias) {
-    throw new Error(`File ${packageFileId} is missing a download alias.`);
-  }
-
-  return {
-    packageFileId,
-    downloadAlias: file.download_alias,
-    fileSize: Number.isFinite(fileSize) ? fileSize : 0
-  };
-}
-
-function validatePackageId(packageId: number, packageName: string): void {
-  if (!Number.isFinite(Number(packageId))) {
-    throw new Error(`Package ${packageName || 'selected package'} is missing a package id.`);
-  }
-}
-
-function formatDownloadStartMessage(files: UiFile[], packageId: number): string {
-  const fileName = files.length === 1
-    ? files[0].download_alias
-    : `${files[0].download_alias} and ${files.length - 1} more`;
-  return `Starting to downloading ${fileName} in package ${packageId}...`;
-}
-
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | null = null;
-
-  const timeout = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
-  });
-
-  return Promise.race([promise, timeout]).finally(() => {
-    if (timer) {
-      clearTimeout(timer);
-    }
-  });
-}
-
-async function fileToBase64(file: File): Promise<string> {
-  const bytes = new Uint8Array(await file.arrayBuffer());
-  let binary = '';
-  const chunkSize = 0x8000;
-
-  for (let index = 0; index < bytes.length; index += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
-  }
-
-  return btoa(binary);
-}
-
-function errorMessage(error: unknown): string {
-  if (error instanceof Error && error.message) {
-    return cleanErrorMessage(error.message);
-  }
-
-  if (typeof error === 'string' && error.trim()) {
-    return cleanErrorMessage(error);
-  }
-
-  if (error && typeof error === 'object') {
-    const record = error as Record<string, unknown>;
-    const directMessage = cleanStringValue(record['message']);
-    const nestedMessage = cleanStringValue(record['error'])
-      || cleanStringValue((record['error'] as Record<string, unknown> | null)?.['message'])
-      || cleanStringValue((record['error'] as Record<string, unknown> | null)?.['errorMessage']);
-
-    if (directMessage && nestedMessage && directMessage !== nestedMessage) {
-      return `${directMessage}: ${nestedMessage}`;
-    }
-
-    if (directMessage) {
-      return directMessage;
-    }
-
-    if (nestedMessage) {
-      return nestedMessage;
-    }
-
-    const status = stringValue(record['status']);
-    const statusText = stringValue(record['statusText']);
-    if (status) {
-      return `Request failed with HTTP ${status}${statusText ? ` ${statusText}` : ''}.`;
-    }
-  }
-
-  return 'An unexpected error occurred.';
-}
-
-function cleanStringValue(value: unknown): string | null {
-  const message = stringValue(value);
-  return message ? cleanErrorMessage(message) : null;
-}
-
-function cleanErrorMessage(message: string): string {
-  return message
-    .replace(/^Error invoking remote method '[^']+':\s*(?:Error:\s*)?/, '')
-    .trim();
-}
-
-function isAbortMessage(message: string | null | undefined): boolean {
-  if (!message) {
-    return false;
-  }
-
-  const normalized = message.toLowerCase();
-  return normalized.includes('abort') || normalized.includes('cancel');
-}
-
-function stringValue(value: unknown): string | null {
-  if (typeof value === 'string' && value.trim()) {
-    return value.trim();
-  }
-
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    return String(value);
-  }
-
-  return null;
 }

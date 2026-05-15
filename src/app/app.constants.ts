@@ -1,0 +1,12 @@
+export const DOWNLOAD_DIR_STORAGE_KEY = 'nda-download-manager.downloadDir';
+export const PACKAGE_PANE_WIDTH_STORAGE_KEY = 'nda-download-manager.packagePaneWidth';
+export const DEFAULT_PACKAGE_PANE_WIDTH = 390;
+export const MIN_PACKAGE_PANE_WIDTH = 280;
+export const MIN_FILE_PANE_WIDTH = 480;
+export const PANE_RESIZER_WIDTH = 18;
+export const LOGIN_GOV_CREATE_ACCOUNT_URL = 'https://www.login.gov/create-an-account';
+export const RAS_NEWS_URL = 'https://nda.nih.gov/nda/ras-news';
+export const HELP_EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+export const HELP_SUBMIT_TIMEOUT_MS = 120000;
+export const HELP_MAX_ATTACHMENTS = 5;
+export const HELP_MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
