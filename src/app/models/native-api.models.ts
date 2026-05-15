@@ -7,6 +7,7 @@ export interface NativeFileInput {
 export interface ScanDownloadRequest {
   targetDir: string;
   packageId: number;
+  packageName: string;
   files: NativeFileInput[];
 }
 
@@ -29,6 +30,7 @@ export interface AvailableSpaceResult {
 export interface ShowPackageRequest {
   targetDir: string;
   packageId: number;
+  packageName: string;
 }
 
 export interface DownloadStartRequest {
@@ -98,13 +100,28 @@ export interface HelpRequest {
   username: string;
   email: string;
   message: string;
+  attachments?: HelpAttachment[];
+  host?: string;
+  packageId?: number | null;
+  packageName?: string | null;
+  packageSource?: string | null;
+  fileCount?: number | null;
   zendeskToken?: string;
+}
+
+export interface HelpAttachment {
+  name: string;
+  mimeType: string;
+  size: number;
+  dataBase64: string;
 }
 
 export interface HelpResponse {
   ok: boolean;
   status: number;
   message: string;
+  ticketId?: string;
+  ticketUrl?: string;
 }
 
 export interface NdaDesktopBridge {

@@ -279,35 +279,65 @@
 </main>
 
 <div class="modal-backdrop" *ngIf="showHelp">
-  <section class="modal" role="dialog" aria-modal="true" aria-labelledby="help-title">
+  <section class="modal help-modal" role="dialog" aria-modal="true" aria-labelledby="help-title">
     <header>
       <h2 id="help-title">Help Request</h2>
       <button class="icon-button" type="button" aria-label="Close" (click)="closeHelp()">x</button>
     </header>
 
-    <label class="field">
-      <span>Full name</span>
-      <input [(ngModel)]="helpForm.name" autocomplete="name">
-    </label>
+    <div class="modal-message error" *ngIf="helpErrorMessage" role="alert">{{ helpErrorMessage }}</div>
+    <div class="modal-message info" *ngIf="helpStatusMessage" aria-live="polite">{{ helpStatusMessage }}</div>
 
-    <label class="field">
-      <span>Username</span>
-      <input [(ngModel)]="helpForm.username" autocomplete="username">
-    </label>
+    <div class="help-field-grid">
+      <label class="field">
+        <span>Full name</span>
+        <input [(ngModel)]="helpForm.name" autocomplete="name" required>
+      </label>
 
-    <label class="field">
-      <span>Email</span>
-      <input [(ngModel)]="helpForm.email" type="email" autocomplete="email">
-    </label>
+      <label class="field">
+        <span>Email</span>
+        <input
+          [(ngModel)]="helpForm.email"
+          type="email"
+          autocomplete="email"
+          inputmode="email"
+          required
+          [class.invalid]="helpEmailInvalid()"
+          [attr.aria-invalid]="helpEmailInvalid() ? 'true' : null"
+          [attr.aria-describedby]="helpEmailInvalid() ? 'help-email-error' : null"
+        >
+        <p id="help-email-error" class="field-error" *ngIf="helpEmailInvalid()">Enter a valid email address.</p>
+      </label>
+
+      <label class="field wide">
+        <span>Username</span>
+        <input [(ngModel)]="helpForm.username" autocomplete="username">
+      </label>
+    </div>
 
     <label class="field">
       <span>Description</span>
-      <textarea [(ngModel)]="helpForm.message" rows="6"></textarea>
+      <textarea [(ngModel)]="helpForm.message" rows="6" required></textarea>
     </label>
+
+    <div class="attachment-field">
+      <input #helpAttachmentInput type="file" multiple hidden (change)="addHelpAttachments($event)">
+      <div class="attachment-toolbar">
+        <span>Attachments</span>
+        <button class="secondary" type="button" [disabled]="sendingHelp" (click)="helpAttachmentInput.click()">Attach Files</button>
+      </div>
+      <div class="attachment-list" *ngIf="helpAttachments.length > 0" aria-label="Attached files">
+        <div class="attachment-row" *ngFor="let attachment of helpAttachments; let i = index">
+          <span>{{ attachment.name }}</span>
+          <small>{{ formatBytes(attachment.size) }}</small>
+          <button class="link-button" type="button" [disabled]="sendingHelp" (click)="removeHelpAttachment(i)">Remove</button>
+        </div>
+      </div>
+    </div>
 
     <footer>
       <button class="secondary" type="button" (click)="closeHelp()">Cancel</button>
-      <button class="primary" type="button" [disabled]="sendingHelp" (click)="submitHelp()">{{ sendingHelp ? 'Sending' : 'Send' }}</button>
+      <button class="primary" type="button" [disabled]="sendingHelp || helpEmailInvalid()" (click)="submitHelp()">{{ sendingHelp ? 'Sending' : 'Send' }}</button>
     </footer>
   </section>
 </div>

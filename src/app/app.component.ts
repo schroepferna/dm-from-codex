@@ -9,7 +9,7 @@ import {
   UiFile,
   UiPackage
 } from './models/package.models';
-import { AuthCancelledPayload, DownloadEvent, NativeFileInput } from './models/native-api.models';
+import { AuthCancelledPayload, DownloadEvent, HelpAttachment, NativeFileInput } from './models/native-api.models';
 import { AuthService } from './services/auth.service';
 import { DownloadService } from './services/download.service';
 import { HelpService } from './services/help.service';
@@ -24,6 +24,10 @@ const MIN_FILE_PANE_WIDTH = 480;
 const PANE_RESIZER_WIDTH = 18;
 const LOGIN_GOV_CREATE_ACCOUNT_URL = 'https://www.login.gov/create-an-account';
 const RAS_NEWS_URL = 'https://nda.nih.gov/nda/ras-news';
+const HELP_EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const HELP_SUBMIT_TIMEOUT_MS = 120000;
+const HELP_MAX_ATTACHMENTS = 5;
+const HELP_MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 
 interface DownloadTargetSummary {
   isPackage: boolean;
@@ -83,6 +87,9 @@ export class AppComponent implements OnInit, OnDestroy {
   sendingHelp = false;
   errorMessage: string | null = null;
   infoMessage: string | null = null;
+  helpErrorMessage: string | null = null;
+  helpStatusMessage: string | null = null;
+  helpAttachments: HelpAttachment[] = [];
 
   private readonly destroyed$ = new Subject<void>();
   private readonly latestJobEvents = new Map<string, DownloadEvent>();
@@ -329,6 +336,9 @@ export class AppComponent implements OnInit, OnDestroy {
     this.associatingPackageId = null;
     this.startingDownload = false;
     this.sendingHelp = false;
+    this.helpErrorMessage = null;
+    this.helpStatusMessage = null;
+    this.helpAttachments = [];
     this.completingSessionId = null;
     this.clearMessages();
   }
@@ -518,6 +528,7 @@ export class AppComponent implements OnInit, OnDestroy {
       const results = await this.native.scanDownloadDirectory({
         targetDir: this.downloadDirectory,
         packageId: this.selectedPackage.id,
+        packageName: this.selectedPackage.name,
         files: this.files.map((file) => toNativeFile(file))
       });
       const byFileId = new Map(results.map((result) => [result.packageFileId, result]));
@@ -734,7 +745,8 @@ export class AppComponent implements OnInit, OnDestroy {
 
       await this.native.showPackageInFolder({
         targetDir: this.downloadDirectory,
-        packageId: pkg.id
+        packageId: pkg.id,
+        packageName: pkg.name
       });
     } catch (error) {
       this.errorMessage = errorMessage(error);
@@ -843,6 +855,8 @@ export class AppComponent implements OnInit, OnDestroy {
 
   openHelp(): void {
     this.showHelp = true;
+    this.helpErrorMessage = null;
+    this.helpStatusMessage = null;
     this.helpForm.username = this.authState.username || this.helpForm.username;
   }
 
@@ -869,32 +883,111 @@ export class AppComponent implements OnInit, OnDestroy {
 
   closeHelp(): void {
     this.showHelp = false;
+    this.helpErrorMessage = null;
+    this.helpStatusMessage = null;
+  }
+
+  helpEmailInvalid(): boolean {
+    const email = this.helpForm.email.trim();
+    return email.length > 0 && !HELP_EMAIL_PATTERN.test(email);
+  }
+
+  async addHelpAttachments(event: Event): Promise<void> {
+    const input = event.target as HTMLInputElement;
+    const selectedFiles = Array.from(input.files ?? []);
+    input.value = '';
+
+    if (selectedFiles.length === 0) {
+      return;
+    }
+
+    this.helpErrorMessage = null;
+
+    if (this.helpAttachments.length + selectedFiles.length > HELP_MAX_ATTACHMENTS) {
+      this.helpErrorMessage = `Attach up to ${HELP_MAX_ATTACHMENTS} files.`;
+      return;
+    }
+
+    try {
+      const attachments = await Promise.all(selectedFiles.map((file) => this.toHelpAttachment(file)));
+      this.helpAttachments = [...this.helpAttachments, ...attachments];
+    } catch (error) {
+      this.helpErrorMessage = errorMessage(error);
+    } finally {
+      this.changeDetector.detectChanges();
+    }
+  }
+
+  removeHelpAttachment(index: number): void {
+    this.helpAttachments = this.helpAttachments.filter((_attachment, attachmentIndex) => attachmentIndex !== index);
   }
 
   async submitHelp(): Promise<void> {
     this.clearMessages();
+    this.helpErrorMessage = null;
+    this.helpStatusMessage = null;
 
-    if (!this.helpForm.name.trim() || !this.helpForm.email.trim() || !this.helpForm.message.trim()) {
+    const name = this.helpForm.name.trim();
+    const username = this.helpForm.username.trim();
+    const email = this.helpForm.email.trim();
+    const message = this.helpForm.message.trim();
+
+    if (!name || !email || !message) {
       this.errorMessage = 'Name, email, and message are required.';
+      this.helpErrorMessage = this.errorMessage;
+      return;
+    }
+
+    if (!HELP_EMAIL_PATTERN.test(email)) {
+      this.errorMessage = 'Enter a valid email address.';
+      this.helpErrorMessage = this.errorMessage;
       return;
     }
 
     this.sendingHelp = true;
+    this.helpStatusMessage = 'Sending Help Request...';
 
     try {
-      await this.help.submit({
-        name: this.helpForm.name.trim(),
-        username: this.helpForm.username.trim(),
-        email: this.helpForm.email.trim(),
-        message: this.helpForm.message.trim()
-      });
+      const result = await withTimeout(this.help.submit({
+        name,
+        username,
+        email,
+        message,
+        attachments: this.helpAttachments,
+        host: this.authState.host,
+        packageId: this.selectedPackage?.id ?? null,
+        packageName: this.selectedPackage?.name ?? null,
+        packageSource: this.selectedPackage?.source ?? null,
+        fileCount: this.selectedPackage?.fileCount ?? (this.files.length || null)
+      }), HELP_SUBMIT_TIMEOUT_MS, 'Help request timed out. Please try again.');
       this.showHelp = false;
-      this.infoMessage = 'Help request sent.';
+      this.helpAttachments = [];
+      this.helpStatusMessage = null;
+      this.infoMessage = result.ticketId
+        ? `Successfully created Zendesk ticket. Ticket ID is ${result.ticketId}`
+        : 'Successfully created Zendesk ticket. Ticket ID is unavailable.';
     } catch (error) {
       this.errorMessage = errorMessage(error);
+      this.helpErrorMessage = this.errorMessage;
+      this.helpStatusMessage = null;
     } finally {
       this.sendingHelp = false;
+      this.changeDetector.detectChanges();
     }
+  }
+
+  private async toHelpAttachment(file: File): Promise<HelpAttachment> {
+    if (file.size > HELP_MAX_ATTACHMENT_BYTES) {
+      throw new Error(`${file.name} is larger than ${this.formatBytes(HELP_MAX_ATTACHMENT_BYTES)}.`);
+    }
+
+    const dataBase64 = await fileToBase64(file);
+    return {
+      name: file.name,
+      mimeType: file.type || 'application/octet-stream',
+      size: file.size,
+      dataBase64
+    };
   }
 
   formatBytes(bytes: number | null | undefined): string {
@@ -1251,7 +1344,7 @@ export class AppComponent implements OnInit, OnDestroy {
       this.jobDownloadTargets.delete(event.jobId);
       this.cancelledJobIds.delete(event.jobId);
       if (!isAbortMessage(event.message)) {
-        this.errorMessage = event.message || 'Download failed.';
+        this.errorMessage = this.formatPackageDownloadFailureMessage(event);
       }
     }
 
@@ -1359,6 +1452,10 @@ export class AppComponent implements OnInit, OnDestroy {
     const listedNames = target.fileNames.slice(0, 5).join(', ');
     const remainingCount = target.fileNames.length - 5;
     return `${action} downloading files ${listedNames}${remainingCount > 0 ? ` and ${remainingCount} more` : ''}`;
+  }
+
+  private formatPackageDownloadFailureMessage(event: DownloadEvent): string {
+    return `Failed to download files in Package ${event.packageName} with ID ${event.packageId}`;
   }
 
   private markJobRowStatus(jobId: string, status: DownloadEvent['status']): void {
@@ -1616,6 +1713,18 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string)
       clearTimeout(timer);
     }
   });
+}
+
+async function fileToBase64(file: File): Promise<string> {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let binary = '';
+  const chunkSize = 0x8000;
+
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+  }
+
+  return btoa(binary);
 }
 
 function errorMessage(error: unknown): string {

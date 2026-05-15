@@ -910,6 +910,16 @@ header.topbar .user-menu-panel .secondary:hover {
   gap: 6px;
 }
 
+.help-field-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.help-field-grid .wide {
+  grid-column: 1 / -1;
+}
+
 .field span {
   color: #323a45;
   font-size: 12px;
@@ -926,6 +936,79 @@ textarea {
   background: #ffffff;
   color: #323a45;
   padding: 7px 9px;
+}
+
+input.invalid {
+  border-color: #b81111;
+}
+
+.field-error {
+  color: #8d1f1f;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.attachment-field {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid #d8e7f3;
+  background: #f8f8f8;
+}
+
+.attachment-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+}
+
+.attachment-toolbar span {
+  color: #323a45;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.attachment-list {
+  display: grid;
+  gap: 6px;
+  width: 100%;
+}
+
+.attachment-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 36px;
+  padding: 6px 8px;
+  border: 1px solid #d8e7f3;
+  background: #ffffff;
+}
+
+.attachment-row span {
+  min-width: 0;
+  overflow: hidden;
+  color: #323a45;
+  font-size: 13px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-row small {
+  color: #5f6b7a;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.attachment-row .link-button {
+  min-height: 28px;
+  padding: 0 2px;
+  font-size: 12px;
 }
 
 textarea {
@@ -1009,15 +1092,42 @@ button:disabled {
   position: relative;
   z-index: 1001;
   display: grid;
-  gap: 14px;
+  gap: 16px;
   width: min(560px, 100%);
   max-height: calc(100vh - 36px);
   overflow: auto;
-  padding: 18px;
+  padding: 20px;
   border: 1px solid #a6c9e2;
   border-radius: 2px;
   background: #ffffff;
   box-shadow: 0 18px 48px rgba(15, 23, 42, 0.28);
+}
+
+.help-modal {
+  width: min(640px, 100%);
+}
+
+.modal-message {
+  padding: 10px 12px;
+  border: 1px solid #a6c9e2;
+  border-left: 4px solid #205493;
+  background: #f8f8f8;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.modal-message.error {
+  border-color: #b81111;
+  border-left-color: #b81111;
+  background: #fff5f5;
+  color: #8d1f1f;
+}
+
+.modal-message.info {
+  border-left-color: #2f9c2f;
+  background: #f5fbf5;
+  color: #2f6f2f;
 }
 
 .modal header,
@@ -1028,7 +1138,14 @@ button:disabled {
   gap: 12px;
 }
 
+.modal header {
+  padding-bottom: 12px;
+  border-bottom: 1px solid #d8e7f3;
+}
+
 .modal footer {
+  padding-top: 12px;
+  border-top: 1px solid #d8e7f3;
   justify-content: flex-end;
 }
 
@@ -1062,5 +1179,24 @@ button:disabled {
   .directory-row,
   .job-row {
     grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 640px) {
+  .help-field-grid,
+  .attachment-row {
+    grid-template-columns: 1fr;
+  }
+
+  .attachment-toolbar,
+  .modal footer {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .attachment-toolbar .secondary,
+  .modal footer .primary,
+  .modal footer .secondary {
+    width: 100%;
   }
 }
